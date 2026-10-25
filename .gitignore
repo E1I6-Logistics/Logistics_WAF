@@ -1,0 +1,61 @@
+# ROS 2 / colcon generated output
+/build/
+/install/
+/log/
+# Keep these root-scoped: DynamixelSDK's c/build and c++/build contain Makefiles.
+
+# Local ROS runtime data and recordings
+/.ros/
+/rosbag2_*/
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.log
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+/coverage.xml
+.ipynb_checkpoints/
+
+# Editor / operating-system state
+.vs/
+.idea/
+*.suo
+*.vcxproj.user
+*.csproj.user
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Generated SDK outputs; retain project files, source, and bundled dependencies.
+/src/DynamixelSDK/c\#/**/obj/
+/src/DynamixelSDK/c\#/**/bin/
+/src/DynamixelSDK/c/build/win*/output/
+/src/DynamixelSDK/c++/build/win*/output/
+/src/DynamixelSDK/documents/cpp/html/
+
+# Local credentials and tool state
+.env
+.env.*
+!.env.example
+/.aws/
+/.codex/
+/.agents/
