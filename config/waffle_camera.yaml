@@ -1,0 +1,13 @@
+/camera:
+  ros__parameters:
+    use_sim_time: false
+    camera: 0
+    role: "viewfinder"
+    width: 640
+    height: 480
+    format: "RGB888"
+    sensor_mode: "1640:1232"
+    FrameDurationLimits: [66666, 66666]
+    jpeg_quality: 80
+    frame_id: "camera_rgb_optical_frame"
+    camera_info_url: "file:///home/waffle/camera_ws/config/imx219_640x480_20261027.yaml"

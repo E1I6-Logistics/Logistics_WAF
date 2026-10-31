@@ -1,0 +1,45 @@
+# User-supplied dimensions, 2026-10-29. All values below are millimeters.
+# Reference record only; NOT consumed by the motion controller.
+# Unresolved measurement references must not be silently interpreted.
+units: mm
+pallet:
+  opening_width: 35.158
+  opening_height: 9.165
+  reported_two_opening_horizontal_dimension: 21.248
+  horizontal_dimension_reference: center_web_width_confirmed_by_user_image
+  image_displayed_center_web_dimension: '21.248 cm'
+  physical_scale_verified: true  # User confirmed real dimensions are mm; CAD scale differs.
+  center_web_width: 21.248
+  opening_center_to_center_spacing: 56.406
+  internal_depth: 119
+fork:
+  tine_width: 15
+  tine_thickness: 4
+  reported_two_tine_spacing: 30
+  spacing_reference: inner_clear_gap_confirmed_by_user_image
+  inner_clear_gap: 30
+  center_to_center_spacing: 45  # 30 mm gap + one 15 mm tine width.
+  image_displayed_inner_gap_dimension: '3.00 cm'
+  tine_length: 125
+  projection_from_body_front: 148
+  projection_measurement_quality: approximate_user_measurement
+requested_operation:
+  alignment_body_front_gap: 170
+  insertion_depth_from_pallet_front: 115
+derived_nominal_geometry:
+  # Assumes straight, level, correctly aligned insertion; not motion commands.
+  tip_clearance_at_requested_alignment_gap: 22  # 170 - 148.
+  body_front_gap_at_desired_insertion_depth: 33  # 148 - 115.
+  clearance_to_internal_obstacle_at_desired_depth: 4  # 119 - 115.
+  forward_travel_from_alignment_gap_to_desired_depth: 137  # 22 + 115; no insertion command.
+  minimum_lateral_clearance_when_centered: 4.376
+  vertical_clearance_when_centered_each_side: 2.5825
+status:
+  mechanical_fit_verified: false
+  insertion_implemented: false
+  camera_to_base_tf_verified: false
+  camera_tf_model: waffle_pi_imx219_standard
+  camera_tf_software_verified: true
+  camera_optical_origin_in_base_link: [76, 0, 93]  # mm; nominal mounting geometry.
+  base_link_to_body_front: 68  # mm, user measured from the drive-wheel axle line.
+  alignment_gap_revision_required: false

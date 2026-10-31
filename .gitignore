@@ -15,6 +15,20 @@
 *.mcap
 *.log
 
+# Camera calibration source images and local capture archives
+/calibration/captures/
+
+# Original pallet training captures (JPEG, preview video, per-frame metadata)
+# Ignore the entire capture directories, including future recording sessions.
+/datasets/pallet/raw/
+/datasets/pallet/curated/
+/datasets/pallet/processed/
+/runs/pallet_pose/
+
+# Local previews, trial results, diagnostics and backup copies (keep on disk).
+# Executable source and the active trial configuration live in src/ and config/.
+/output/
+
 # Python caches and virtual environments
 __pycache__/
 *.py[cod]

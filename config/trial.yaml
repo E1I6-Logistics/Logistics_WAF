@@ -1,0 +1,49 @@
+# Default bounded YOLO+LM alignment trial. Distances are meters.
+# User confirmed mounting TF and 152mm fork projection on 2026-10-31.
+# No insertion; trial limits apply only to the alignment stage, not Nav2 travel.
+opening_width: 0.035158
+opening_height: 0.009165
+center_web_width: 0.021248
+target_body_gap: 0.31
+fork_projection: 0.152
+extrinsics_verified: true
+base_frame: base_link
+body_front_x: 0.068
+image_topic: /camera/image_raw/compressed
+camera_info_topic: /camera/camera_info
+cmd_vel_topic: /cmd_vel_nav
+camera_enable_service: /camera/enable
+detector: yolo_pose
+pose_model: /home/sojeong/turtlebot3_ws/src/best.pt
+pose_device: cpu
+pose_imgsz: 640
+pose_confidence: 0.5
+keypoint_confidence: 0.7
+roi:
+- 0.05
+- 0.45
+- 0.95
+- 0.95
+dark_threshold: 65
+min_opening_height_px: 8
+max_reprojection_error_px: 1.5
+max_pose_range: 1.2
+min_pose_range: 0.08
+max_pallet_yaw_deg: 35.0
+lateral_tolerance: 0.008
+gap_tolerance: 0.005
+yaw_tolerance_deg: 4.0
+near_guard_gap: 0.32
+min_body_gap: 0.28
+max_linear_speed: 0.01
+max_angular_speed: 0.05
+stable_frames: 8
+max_image_age: 0.4
+max_info_age: 2.0
+lost_timeout: 2.0
+alignment_timeout: 18.0
+startup_timeout: 12.0
+pose_refine_lm: true
+trial_max_motion_seconds: 3.0
+trial_max_displacement: 0.035
+trial_max_yaw_change: 0.16

@@ -20,9 +20,12 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch.substitutions import NotEqualsSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 TURTLEBOT3_MODEL = os.environ['TURTLEBOT3_MODEL']
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
@@ -30,6 +33,7 @@ ROS_DISTRO = os.environ.get('ROS_DISTRO')
 
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
+    mask_yaml_file = LaunchConfiguration('mask', default='')
     map_dir = LaunchConfiguration(
         'map',
         default=os.path.join(
@@ -61,13 +65,7 @@ def generate_launch_description():
         'rviz',
         'tb3_navigation2.rviz')
 
-    has_mask = IfCondition(
-        PythonExpression([
-            "'",
-            mask_yaml_file,
-            "' != ''"
-        ])
-    )
+    has_mask = IfCondition(NotEqualsSubstitution(mask_yaml_file, ''))
     return LaunchDescription([
         DeclareLaunchArgument(
             'map',
@@ -78,6 +76,11 @@ def generate_launch_description():
             'params_file',
             default_value=param_dir,
             description='Full path to param file to load'),
+
+        DeclareLaunchArgument(
+            'mask',
+            default_value='',
+            description='Keepout mask YAML path; empty skips the filter servers'),
 
         DeclareLaunchArgument(
             'use_sim_time',
@@ -110,11 +113,38 @@ def generate_launch_description():
 
             parameters=[{
                 'use_sim_time': use_sim_time,
-                'yaml_filename': mask_yaml_file
+                'yaml_filename': ParameterValue(mask_yaml_file, value_type=str),
+                'topic_name': '/keepout_filter_mask',
+                'frame_id': 'map',
             }],
+        ),
 
-            remappings=[
-                ('/map', '/keepout_filter_mask')
-            ]
+        Node(
+            condition=has_mask,
+            package='nav2_map_server',
+            executable='costmap_filter_info_server',
+            name='costmap_filter_info_server',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'type': 0,
+                'filter_info_topic': '/costmap_filter_info',
+                'mask_topic': '/keepout_filter_mask',
+                'base': 0.0,
+                'multiplier': 1.0,
+            }],
+        ),
+
+        Node(
+            condition=has_mask,
+            package='nav2_lifecycle_manager',
+            executable='lifecycle_manager',
+            name='lifecycle_manager_costmap_filters',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'autostart': True,
+                'node_names': ['filter_mask_server', 'costmap_filter_info_server'],
+            }],
         ),
     ])

@@ -1,0 +1,251 @@
+diff --git a/src/CameraNode.cpp b/src/CameraNode.cpp
+index 76ed413..58a296e 100644
+--- a/src/CameraNode.cpp
++++ b/src/CameraNode.cpp
+@@ -19,7 +19,7 @@
+ #include <iostream>
+ #include <libcamera/base/shared_fd.h>
+ #include <libcamera/base/signal.h>
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/camera.h>
+ #include <libcamera/camera_manager.h>
+ #include <libcamera/control_ids.h>
+diff --git a/src/ParameterHandler.cpp b/src/ParameterHandler.cpp
+index 093b9ae..fe7a018 100644
+--- a/src/ParameterHandler.cpp
++++ b/src/ParameterHandler.cpp
+@@ -5,7 +5,7 @@
+ #include "type_extent.hpp"
+ #include "types.hpp"
+ #include <cstddef>
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/control_ids.h>
+ #include <libcamera/controls.h>
+ #include <rcl_interfaces/msg/floating_point_range.hpp>
+@@ -107,7 +107,7 @@ ParameterHandler::declare(const libcamera::ControlInfoMap &controls)
+     }
+ 
+     const bool ctrl_scalar = (extent == 0);
+-    const bool ctrl_dynamic = (extent == libcamera::dynamic_extent);
++    const bool ctrl_dynamic = (extent == std::dynamic_extent);
+     const bool ctrl_fixed = !(ctrl_scalar || ctrl_dynamic);
+ 
+     if (ctrl_fixed && !cv_def.isArray() && !cv_def.isNone()) {
+@@ -401,7 +401,7 @@ ParameterHandler::validate_new_parameters(const std::vector<rclcpp::Parameter> &
+     // check array dimension
+     const std::size_t extent = get_extent(id);
+     if (value.isArray() &&
+-        (extent != libcamera::dynamic_extent) &&
++        (extent != std::dynamic_extent) &&
+         (value.numElements() != extent)) {
+       msgs_valid_check.push_back(
+         parameter.get_name() + ": array dimensions mismatch, expected " +
+diff --git a/src/clamp.cpp b/src/clamp.cpp
+index b509753..e3dad34 100644
+--- a/src/clamp.cpp
++++ b/src/clamp.cpp
+@@ -4,7 +4,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstddef>
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/controls.h>
+ #include <libcamera/geometry.h>
+ #include <stdexcept>
+@@ -34,7 +34,7 @@ typename ControlTypeMap<T>::type
+ min(const libcamera::ControlValue &value)
+ {
+   using A = typename ControlTypeMap<T>::type;
+-  using S = libcamera::Span<const A>;
++  using S = std::span<const A>;
+ 
+   if (value.isArray()) {
+     const S v = value.get<S>();
+@@ -50,7 +50,7 @@ typename ControlTypeMap<T>::type
+ max(const libcamera::ControlValue &value)
+ {
+   using A = typename ControlTypeMap<T>::type;
+-  using S = libcamera::Span<const A>;
++  using S = std::span<const A>;
+ 
+   if (value.isArray()) {
+     const S v = value.get<S>();
+@@ -109,14 +109,14 @@ clamp_array(const libcamera::ControlValue &value, const libcamera::ControlValue
+   assert(min.isArray() == max.isArray());
+   assert(min.numElements() == max.numElements());
+ 
+-  const libcamera::Span<const T> v = value.get<libcamera::Span<const T>>();
++  const std::span<const T> v = value.get<std::span<const T>>();
+ 
+   std::vector<T> vclamp(v.size());
+ 
+   if (min.isArray() == true && max.isArray() == true) {
+     // clamp individual elements with their individual min/max values
+-    const libcamera::Span<const T> a = min.get<libcamera::Span<const T>>();
+-    const libcamera::Span<const T> b = max.get<libcamera::Span<const T>>();
++    const std::span<const T> a = min.get<std::span<const T>>();
++    const std::span<const T> b = max.get<std::span<const T>>();
+     for (size_t i = 0; i < v.size(); i++)
+       vclamp[i] = std::clamp(v[i], a[i], b[i]);
+   }
+@@ -131,7 +131,7 @@ clamp_array(const libcamera::ControlValue &value, const libcamera::ControlValue
+     throw should_not_reach();
+   }
+ 
+-  return libcamera::ControlValue(libcamera::Span<const T>(vclamp));
++  return libcamera::ControlValue(std::span<const T>(vclamp));
+ }
+ 
+ template<typename T,
+@@ -224,10 +224,10 @@ bool
+ less(const libcamera::ControlValue &lhs, const libcamera::ControlValue &rhs)
+ {
+   if (lhs.isArray()) {
+-    const libcamera::Span<const T> va = lhs.get<libcamera::Span<const T>>();
++    const std::span<const T> va = lhs.get<std::span<const T>>();
+     if (rhs.isArray()) {
+       // array-array comparison
+-      const libcamera::Span<const T> vb = rhs.get<libcamera::Span<const T>>();
++      const std::span<const T> vb = rhs.get<std::span<const T>>();
+       // check if any lhs element is less than its corresponding rhs element
+       for (size_t i = 0; i < va.size(); i++)
+         if (va[i] < vb[i])
+@@ -245,7 +245,7 @@ less(const libcamera::ControlValue &lhs, const libcamera::ControlValue &rhs)
+   }
+   else if (rhs.isArray()) {
+     // scalar-array comparison
+-    const libcamera::Span<const T> vb = rhs.get<libcamera::Span<const T>>();
++    const std::span<const T> vb = rhs.get<std::span<const T>>();
+     const T va = lhs.get<T>();
+     for (size_t i = 0; i < vb.size(); i++)
+       if (va < vb[i])
+@@ -264,10 +264,10 @@ bool
+ greater(const libcamera::ControlValue &lhs, const libcamera::ControlValue &rhs)
+ {
+   if (lhs.isArray()) {
+-    const libcamera::Span<const T> va = lhs.get<libcamera::Span<const T>>();
++    const std::span<const T> va = lhs.get<std::span<const T>>();
+     if (rhs.isArray()) {
+       // array-array comparison
+-      const libcamera::Span<const T> vb = rhs.get<libcamera::Span<const T>>();
++      const std::span<const T> vb = rhs.get<std::span<const T>>();
+       // check if any lhs element is greater than its corresponding rhs element
+       for (size_t i = 0; i < va.size(); i++)
+         if (va[i] > vb[i])
+@@ -285,7 +285,7 @@ greater(const libcamera::ControlValue &lhs, const libcamera::ControlValue &rhs)
+   }
+   else if (rhs.isArray()) {
+     // scalar-array comparison
+-    const libcamera::Span<const T> vb = rhs.get<libcamera::Span<const T>>();
++    const std::span<const T> vb = rhs.get<std::span<const T>>();
+     const T va = lhs.get<T>();
+     for (size_t i = 0; i < vb.size(); i++)
+       if (va > vb[i])
+diff --git a/src/cv_to_pv.cpp b/src/cv_to_pv.cpp
+index 65b2465..732a53b 100644
+--- a/src/cv_to_pv.cpp
++++ b/src/cv_to_pv.cpp
+@@ -3,7 +3,7 @@
+ #include "type_extent.hpp"
+ #include "types.hpp"
+ #include <cstdint>
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/controls.h>
+ #include <libcamera/geometry.h>
+ #include <rclcpp/parameter_value.hpp>
+@@ -26,7 +26,7 @@ std::vector<T>
+ extract_value(const libcamera::ControlValue &value)
+ {
+   if (value.isArray()) {
+-    const libcamera::Span<const T> span = value.get<libcamera::Span<const T>>();
++    const std::span<const T> span = value.get<std::span<const T>>();
+     return std::vector<T>(span.begin(), span.end());
+   }
+   else {
+diff --git a/src/pv_to_cv.cpp b/src/pv_to_cv.cpp
+index 1f8b9ee..8ddb54c 100644
+--- a/src/pv_to_cv.cpp
++++ b/src/pv_to_cv.cpp
+@@ -3,7 +3,7 @@
+ #include "libcamera_version_utils.hpp"
+ #include "types.hpp"
+ #include <cstdint>
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/controls.h>
+ #include <libcamera/geometry.h>
+ #include <rclcpp/parameter.hpp>
+@@ -17,7 +17,7 @@
+ 
+ #define CASE_CONVERT_INT_ARRAY(T) \
+   case libcamera::ControlType##T: \
+-    return libcamera::Span<const ControlTypeMap<libcamera::ControlType##T>::type>(std::vector<ControlTypeMap<libcamera::ControlType##T>::type>(values.begin(), values.end()));
++    return std::span<const ControlTypeMap<libcamera::ControlType##T>::type>(std::vector<ControlTypeMap<libcamera::ControlType##T>::type>(values.begin(), values.end()));
+ 
+ #define CASE_NONE(T)              \
+   case libcamera::ControlType##T: \
+@@ -38,7 +38,7 @@ pv_to_cv_int_array(const std::vector<int64_t> &values, const libcamera::ControlT
+     CASE_INVALID(Byte)
+     CASE_CONVERT_INT_ARRAY(Integer32)
+   case libcamera::ControlTypeInteger64:
+-    return libcamera::Span<const CTInteger64>(values);
++    return std::span<const CTInteger64>(values);
+ #if LIBCAMERA_VER_GE(0, 4, 0)
+     CASE_CONVERT_INT_ARRAY(Unsigned16)
+     CASE_CONVERT_INT_ARRAY(Unsigned32)
+@@ -97,14 +97,14 @@ pv_to_cv(const rclcpp::Parameter &parameter, const libcamera::ControlType &type)
+   case rclcpp::ParameterType::PARAMETER_STRING:
+     return CTString(parameter.as_string());
+   case rclcpp::ParameterType::PARAMETER_BYTE_ARRAY:
+-    return libcamera::Span<const CTByte>(parameter.as_byte_array());
++    return std::span<const CTByte>(parameter.as_byte_array());
+   case rclcpp::ParameterType::PARAMETER_BOOL_ARRAY:
+     throw invalid_conversion("cannot convert bool array to control value");
+   case rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY:
+     return pv_to_cv_int_array(parameter.as_integer_array(), type);
+   case rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY:
+     // convert to float vector
+-    return libcamera::Span<const CTFloat>(
++    return std::span<const CTFloat>(
+       std::vector<CTFloat>(parameter.as_double_array().begin(), parameter.as_double_array().end()));
+   case rclcpp::ParameterType::PARAMETER_STRING_ARRAY:
+     // manually convert vector<string> to vector<string_view>
+@@ -112,7 +112,7 @@ pv_to_cv(const rclcpp::Parameter &parameter, const libcamera::ControlType &type)
+     for (const std::string &s : parameter.as_string_array()) {
+       string_view_list.emplace_back(s);
+     }
+-    return libcamera::Span<const CTString>(string_view_list);
++    return std::span<const CTString>(string_view_list);
+   }
+   throw should_not_reach();
+ }
+diff --git a/src/type_extent.cpp b/src/type_extent.cpp
+index f122d57..fdfa075 100644
+--- a/src/type_extent.cpp
++++ b/src/type_extent.cpp
+@@ -12,7 +12,7 @@ get_extent(const libcamera::ControlId *const id)
+ 
+ #else
+ #include "exceptions.hpp"
+-#include <libcamera/base/span.h>
++#include <span>
+ #include <libcamera/controls.h>
+ #include <stdexcept>
+ #include <string>
+diff --git a/src/type_extent.hpp b/src/type_extent.hpp
+index ca9b9d1..b912ff4 100644
+--- a/src/type_extent.hpp
++++ b/src/type_extent.hpp
+@@ -10,7 +10,7 @@ class ControlId;
+  * @brief get the extent of a libcamera::ControlId
+  * @param id
+  * @return the extent of the control: 0 if the control is not a span,
+- *         otherwise [1 ... libcamera::dynamic_extent]
++ *         otherwise [1 ... std::dynamic_extent]
+  */
+ std::size_t
+ get_extent(const libcamera::ControlId *const id);
