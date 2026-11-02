@@ -1,4 +1,8 @@
-"""Reusable bounded alignment trial. Observe mode never publishes velocity."""
+"""Fixed-target alignment: observe while stopped, move on odometry, re-observe.
+
+Observe mode never publishes velocity. With --execute, a verified alignment is
+followed by a straight fork insertion on odometry, a lift and a straight retreat.
+"""
 import argparse
 from datetime import datetime
 import json
@@ -7,16 +11,24 @@ from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
 
+import cv2
+import numpy as np
 import rclpy
+from rclpy.time import Time
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.signals import SignalHandlerOptions
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TwistStamped
 from action_msgs.msg import GoalStatusArray
 from turtlebot3_msgs.msg import SensorState
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
+from tf2_ros import TransformException
 
 from pallet_alignment import PalletAligner
-from pallet_vision import load_config, validate_motion_config
+from pallet_vision import load_config, validate_motion_config, quaternion_matrix, vertical_face_target
+from pallet_alignment_control import (aligned, alignment_errors, fixed_pallet, pallet_in_odom,
+                                      plan_moves, validate_fixed_target_config, wrap_angle)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / 'config/trial.yaml'
@@ -24,16 +36,38 @@ DEFAULT_OUTPUT = ROOT / 'output/pallet_alignment_trials'
 
 
 def validate_trial_config(cfg):
-    """Do not let a config override silently remove bounded-trial limits."""
-    if cfg.get('detector') != 'yolo_pose' or cfg.get('pose_refine_lm') is not True:
-        raise ValueError('Trial requires detector: yolo_pose and pose_refine_lm: true')
-    limits = {'trial_max_motion_seconds': 3.0, 'trial_max_displacement': .035,
-              'trial_max_yaw_change': .16, 'max_linear_speed': .010,
-              'max_angular_speed': .050}
-    for key, ceiling in limits.items():
+    validate_fixed_target_config(cfg)
+    for key in ('lift_time', 'retreat_distance'):
         value = cfg.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= ceiling:
-            raise ValueError(f'{key} must be positive and <= {ceiling}')
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f'{key} must be finite and positive')
+    if (cfg.get('detector') != 'yolo_pose' or cfg.get('pose_refine_lm') is not True
+            or cfg.get('vertical_face_fit') is not True):
+        raise ValueError('Trial requires detector: yolo_pose, pose_refine_lm and vertical_face_fit: true')
+    # OpenCR receives int(v*100): commands below 0.01 become zero.
+    for key, ceiling in (('max_linear_speed', .010), ('insertion_speed', .040), ('max_angular_speed', .050)):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not .01 <= value <= ceiling:
+            raise ValueError(f'{key} must be within [0.01, {ceiling}]')
+
+
+def lift(node, command, seconds):
+    """Run the linear actuator UP/DOWN for a full stroke, then STOP (no position feedback)."""
+    publisher = node.create_publisher(String, '/linear_actuator/cmd', 10)
+    try:
+        deadline = time.monotonic()+3
+        while publisher.get_subscription_count() == 0:
+            if time.monotonic() > deadline:
+                raise RuntimeError('No /linear_actuator/cmd subscriber (linear_motor_node)')
+            rclpy.spin_once(node, timeout_sec=.05)
+        node.get_logger().info(f'Lift {command} for {seconds:.1f}s')
+        publisher.publish(String(data=command))
+        until = time.monotonic()+seconds
+        while time.monotonic() < until:
+            rclpy.spin_once(node, timeout_sec=.05)
+    finally:
+        publisher.publish(String(data='STOP'))
+        time.sleep(.2)
 
 
 class Trial(PalletAligner):
@@ -48,6 +82,9 @@ class Trial(PalletAligner):
         self.origin = None
         self.start_time = time.monotonic()
         self.output_velocity = None
+        self.scan = None
+        self.min_stamp = 0
+        self.create_subscription(LaserScan, '/scan', self.receive_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.receive_odom, qos_profile_sensor_data)
         self.create_subscription(SensorState, '/sensor_state', self.receive_sensor, qos_profile_sensor_data)
         self.create_subscription(TwistStamped, '/cmd_vel', self.receive_velocity, qos_profile_sensor_data)
@@ -70,6 +107,80 @@ class Trial(PalletAligner):
     def receive_velocity(self, msg):
         self.output_velocity = msg, time.monotonic()
 
+    def receive_scan(self, msg):
+        self.scan = msg, time.monotonic()
+
+    def check_reverse_clearance(self):
+        """Additional rear check; commands still pass through collision_monitor."""
+        if self.scan is None or time.monotonic()-self.scan[1] > .3:
+            raise RuntimeError('Backoff requires fresh rear LaserScan')
+        scan = self.scan[0]
+        if (not all(math.isfinite(v) for v in (scan.angle_min, scan.angle_increment, scan.range_min, scan.range_max))
+                or scan.angle_increment == 0 or not 0 <= scan.range_min < scan.range_max):
+            raise RuntimeError('Backoff LaserScan metadata is invalid')
+        age = (self.get_clock().now().nanoseconds-Time.from_msg(scan.header.stamp).nanoseconds)*1e-9
+        if not -.05 <= age <= .3:
+            raise RuntimeError('Backoff LaserScan timestamp is stale')
+        try:
+            tf = self.tf_buffer.lookup_transform(self.cfg['base_frame'], scan.header.frame_id,
+                                                Time.from_msg(scan.header.stamp)).transform
+        except TransformException as exc:
+            raise RuntimeError('Backoff requires scan-to-base TF') from exc
+        q, p = tf.rotation, tf.translation
+        if not all(math.isfinite(v) for v in (p.x, p.y, p.z)):
+            raise RuntimeError('Backoff scan-to-base translation is invalid')
+        rotation = quaternion_matrix([q.x, q.y, q.z, q.w])
+        ranges = np.asarray(scan.ranges, dtype=float)
+        angles = scan.angle_min+np.arange(len(ranges))*scan.angle_increment
+        rays = np.column_stack((np.cos(angles), np.sin(angles), np.zeros(len(angles))))@rotation.T
+        bearings = np.arctan2(rays[:, 1], -rays[:, 0])
+        rear = np.abs(bearings) <= math.radians(60)
+        valid = (np.isfinite(ranges) & (ranges >= scan.range_min) & (ranges <= scan.range_max)) | np.isposinf(ranges)
+        covered = np.sort(bearings[rear & valid])
+        if (scan.range_max < .5 or len(covered) < 20
+                or covered[0] > -math.radians(55) or covered[-1] < math.radians(55)
+                or np.max(np.diff(covered)) > math.radians(5)):
+            raise RuntimeError('Backoff rear scan coverage is incomplete')
+        finite = np.isfinite(ranges) & (ranges >= scan.range_min) & (ranges <= scan.range_max)
+        points = rays[finite]*ranges[finite, None]+[p.x, p.y, p.z]
+        # URDF rear face is x=-0.197m. Check an extra ~0.20m behind it,
+        # and a 0.40m-wide corridor including wheels and lateral clearance.
+        blocked = (points[:, 0] < 0) & (points[:, 0] > -.40) & (np.abs(points[:, 1]) < .20)
+        if np.any(blocked):
+            raise RuntimeError('Backoff blocked by rear obstacle')
+
+    def prepare_perception(self):
+        """Pay cold inference/GUI costs before creating a velocity publisher.
+
+        Use the real image size and calibration, but discard this detection.
+        Motion preflight subsequently spins and checks fresh sensor data again.
+        """
+        if self.publisher is not None:
+            raise RuntimeError('Perception preparation must precede motion preflight')
+        self.get_logger().info('Preparing model/display before alignment; no velocity publisher')
+        deadline = time.monotonic()+self.cfg['startup_timeout']
+        last_error = 'Waiting for fresh image and CameraInfo'
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=.05)
+            if self.image is None or not self.image_fresh(*self.image):
+                continue
+            message, _ = self.image
+            started = time.monotonic()
+            try:
+                # A rejected pose is fine here: this only initializes inference/GUI.
+                self.process_image(message)
+            except (ValueError, cv2.error) as exc:
+                last_error = str(exc)
+                continue
+            elapsed = time.monotonic()-started
+            self.records.append({'t': time.monotonic()-self.start_time,
+                                 'perception_preparation_seconds': elapsed})
+            self.image = None
+            self.gate.reset()
+            self.get_logger().info(f'Model/display ready ({elapsed:.3f}s); fresh poses required for alignment')
+            return
+        raise RuntimeError(f'Perception preparation timed out: {last_error}')
+
     def motion_guard(self):
         now = time.monotonic()
         if not self.odometry or not all(math.isfinite(v) for v in self.odometry) or now-self.odometry[3] > .5:
@@ -82,26 +193,40 @@ class Trial(PalletAligner):
             raise RuntimeError('Another navigation/docking action is active')
         if any(e.node_name == 'teleop_keyboard' for e in self.get_publishers_info_by_topic('/cmd_vel')):
             raise RuntimeError('Teleop publisher still connected')
-        if self.first is not None and now-self.first >= self.cfg['trial_max_motion_seconds']:
-            raise RuntimeError('Bounded trial motion time limit reached')
-        if self.origin is not None:
-            distance = math.hypot(self.odometry[0]-self.origin[0], self.odometry[1]-self.origin[1])
-            yaw = abs(math.atan2(math.sin(self.odometry[2]-self.origin[2]),
-                                 math.cos(self.odometry[2]-self.origin[2])))
-            if distance >= self.cfg['trial_max_displacement'] or yaw >= self.cfg['trial_max_yaw_change']:
-                raise RuntimeError('Odometry travel cap reached')
+
+    def stationary(self):
+        return bool(self.odometry and all(math.isfinite(v) for v in self.odometry)
+                    and time.monotonic()-self.odometry[3] < .5
+                    and abs(self.odometry[4]) < .005 and abs(self.odometry[5]) < .02)
 
     def preflight_motion(self):
         until = time.monotonic()+3
         while time.monotonic() < until:
             rclpy.spin_once(self, timeout_sec=.05)
         self.motion_guard()
-        if abs(self.odometry[4]) > .005 or abs(self.odometry[5]) > .02:
+        if not self.stationary():
             raise RuntimeError('Robot is already moving')
+        # A negative command must not be silently clamped by the smoother.
+        from pallet_alignment import wait_result
+        from rcl_interfaces.srv import GetParameters
+        client = self.create_client(GetParameters, '/velocity_smoother/get_parameters')
+        try:
+            if not client.wait_for_service(timeout_sec=3.):
+                raise RuntimeError('Velocity smoother parameter service unavailable')
+            request = GetParameters.Request()
+            request.names = ['min_velocity', 'deadband_velocity']
+            values = wait_result(self, client.call_async(request)).values
+            if (len(values) != 2 or any(v.type != 8 or len(v.double_array_value) != 3 for v in values)
+                    or not math.isfinite(values[0].double_array_value[0])
+                    or values[0].double_array_value[0] > -self.cfg['insertion_speed']
+                    or not 0 <= values[1].double_array_value[0] < self.cfg['max_linear_speed']):
+                raise RuntimeError('Velocity smoother settings do not permit reverse speed')
+        finally:
+            self.destroy_client(client)
         super().preflight_motion()
 
     def chain_active(self):
-        # Check bounds even when detection is lost and the next command would be zero.
+        # Check sensors even without a new detection.
         if self.execute:
             self.motion_guard()
         return super().chain_active()
@@ -110,33 +235,169 @@ class Trial(PalletAligner):
         if self.execute and (linear or angular):
             try:
                 self.motion_guard()
-                if (not math.isfinite(linear) or not math.isfinite(angular) or linear < 0
-                        or linear > self.cfg['max_linear_speed']+1e-9
+                if (not math.isfinite(linear) or not math.isfinite(angular)
+                        or abs(linear) > max(self.cfg['max_linear_speed'], self.cfg['insertion_speed'])+1e-9
                         or abs(angular) > self.cfg['max_angular_speed']+1e-9):
                     raise RuntimeError('Command exceeds trial bounds')
+                if linear < 0:
+                    if abs(angular) > 1e-9:
+                        raise RuntimeError('Backoff must be straight')
+                    self.check_reverse_clearance()
             except RuntimeError:
                 super().command()
                 raise
             if self.first is None:
                 self.first, self.origin = time.monotonic(), self.odometry[:3]
-        self.records.append({'t': time.monotonic()-self.start_time,
-                             'v': linear, 'w': angular, 'odom': self.odometry})
+            self.records.append({'t': time.monotonic()-self.start_time,
+                                 'v': linear, 'w': angular, 'odom': self.odometry})
         super().command(linear, angular)
 
     def base_target(self, detection, message):
-        target = super().base_target(detection, message)
-        self.records.append({'t': time.monotonic()-self.start_time,
-                             'target': target, 'rms_px': detection.error})
+        transform = self.tf_buffer.lookup_transform(
+            self.cfg['base_frame'], message.header.frame_id, Time.from_msg(message.header.stamp))
+        q, p = transform.transform.rotation, transform.transform.translation
+        target = vertical_face_target(detection, *self.camera_model, quaternion_matrix([q.x, q.y, q.z, q.w]),
+                                      np.array([p.x, p.y, p.z]), self.cfg)
+        self.records.append({'t': time.monotonic()-self.start_time, 'target': target, 'rms_px': detection.error})
         return target
+
+    def next_target(self, deadline):
+        """Base target from the next fresh frame captured after min_stamp; None if rejected."""
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=.02)
+            if self.execute and not self.chain_active():
+                raise RuntimeError('Velocity smoother/collision monitor state lost')
+            if self.image is None or not self.image_fresh(*self.image):
+                continue
+            message, received = self.image
+            self.image = None
+            if Time.from_msg(message.header.stamp).nanoseconds <= self.min_stamp:
+                continue
+            try:
+                detection = self.process_image(message)
+                if detection is None:
+                    raise ValueError('No unique valid opening pose; check points, ROI, calibration and PnP fit')
+                if not self.image_fresh(message, received):
+                    raise ValueError('Frame became stale during processing')
+                return self.base_target(detection, message)
+            except (ValueError, cv2.error, TransformException) as error:
+                self.report(str(error))
+                return None
+        return None
+
+    def observe(self):
+        """Pallet (x, y, yaw) in odom from consistent frames taken while stopped."""
+        deadline = time.monotonic()+self.cfg['startup_timeout']
+        samples = []
+        while time.monotonic() < deadline:
+            target = self.next_target(deadline)
+            if target is None or not self.stationary():
+                continue
+            samples = samples[1-self.cfg['stable_frames']:]+[pallet_in_odom(target, self.odometry, self.cfg)]
+            if len(samples) == self.cfg['stable_frames']:
+                pallet = fixed_pallet(samples, self.cfg)
+                if pallet is not None:
+                    return pallet
+            self.report(f'Observing while stopped: {len(samples)}/{self.cfg["stable_frames"]} frames')
+        raise RuntimeError('No consistent pallet observation while stopped (odometry required)')
+
+    def move(self, kind, value, deadline, speed=None):
+        """Turn to an odom heading, or drive a signed straight distance; then settle."""
+        linear = speed or self.cfg['max_linear_speed']
+        start = self.odometry[:2]
+        best, best_time = 0., time.monotonic()
+        while True:
+            if time.monotonic() > deadline:
+                raise RuntimeError('Alignment timeout')
+            rclpy.spin_once(self, timeout_sec=.02)
+            if not self.chain_active():
+                raise RuntimeError('Velocity smoother/collision monitor state lost')
+            if kind == 'turn':
+                error = wrap_angle(value-self.odometry[2])
+                # 0.3deg moves the fork line ~2mm at the pallet face.
+                if abs(error) <= math.radians(.3):
+                    break
+                # 0.01rad/s is the smallest angular command OpenCR does not truncate.
+                speed = .01 if abs(error) < math.radians(3) else self.cfg['max_angular_speed']
+                self.command(0., math.copysign(speed, error))
+            else:
+                travelled = math.hypot(self.odometry[0]-start[0], self.odometry[1]-start[1])
+                if travelled >= abs(value):
+                    break
+                # Blocked (e.g. a fork against the pallet, or collision_monitor): stop, don't push.
+                if travelled > best+.001:
+                    best, best_time = travelled, time.monotonic()
+                elif time.monotonic()-best_time > 3.:
+                    raise RuntimeError(f'Drive stalled after {travelled*1000:.0f}mm of {abs(value)*1000:.0f}mm')
+                self.command(math.copysign(linear, value), 0.)
+        since = None
+        while since is None or time.monotonic()-since < .5:
+            if time.monotonic() > deadline:
+                raise RuntimeError('Alignment timeout')
+            self.command()
+            rclpy.spin_once(self, timeout_sec=.02)
+            since = (since or time.monotonic()) if self.stationary() else None
+        # Frames exposed during motion must not enter the next observation.
+        self.min_stamp = self.get_clock().now().nanoseconds
+
+    def run(self):
+        self.get_logger().info('EXECUTE: fixed-target alignment, insertion, lift, retreat' if self.execute else
+                               'OBSERVE: no velocity commands')
+        try:
+            if self.execute:
+                self.preflight_motion()
+            deadline = time.monotonic()+self.cfg['alignment_timeout']
+            for observation in range(1, self.cfg['max_observations']+1):
+                pallet = self.observe()
+                errors = alignment_errors(pallet, self.odometry, self.cfg)
+                moves = [] if aligned(errors, self.cfg) else plan_moves(pallet, self.odometry, self.cfg)
+                self.records.append({'t': time.monotonic()-self.start_time, 'observation': observation,
+                                     'pallet_odom': pallet, 'odom': self.odometry,
+                                     'errors': errors, 'moves': moves})
+                gap, cross, heading, face = errors
+                self.get_logger().info(f'Observation {observation}: gap={gap:.3f}m, face={face*1000:+.1f}mm, '
+                                       f'heading={math.degrees(heading):+.2f}deg, centerline={cross:+.3f}m; '
+                                       f'moves={moves}')
+                if not moves:
+                    self.get_logger().info('Alignment verified while stopped.')
+                    if self.execute:
+                        # Straight in on odometry; the camera cannot see the openings this close.
+                        travel = gap-self.cfg['fork_projection']+self.cfg['insertion_depth']
+                        self.get_logger().info(f'Inserting forks: straight {travel*1000:.0f}mm forward')
+                        self.records.append({'t': time.monotonic()-self.start_time, 'insertion_travel': travel})
+                        speed = self.cfg['insertion_speed']
+                        self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
+                        lift(self, 'UP', self.cfg['lift_time'])
+                        # Lifecycle polling pauses during the lift; refresh it before moving again.
+                        until = time.monotonic()+3
+                        while not self.chain_active():
+                            if time.monotonic() > until:
+                                raise RuntimeError('Velocity smoother/collision monitor state lost')
+                            rclpy.spin_once(self, timeout_sec=.05)
+                        retreat = self.cfg['retreat_distance']
+                        self.get_logger().info(f'Retreating straight {retreat*1000:.0f}mm')
+                        self.move('drive', -retreat, time.monotonic()+retreat/speed+30, speed)
+                    return True
+                if gap < self.cfg['min_body_gap']:
+                    raise RuntimeError('Pallet is closer than min_body_gap')
+                if any(kind == 'drive' and abs(value) > self.cfg['max_move_distance'] for kind, value in moves):
+                    raise RuntimeError('Planned move exceeds max_move_distance; check the observation')
+                if not self.execute:
+                    return False
+                for kind, value in moves:
+                    self.move(kind, value, deadline)
+            raise RuntimeError('Alignment not verified within max_observations')
+        finally:
+            for _ in range(3):
+                self.command()
+                time.sleep(.03)
 
     def finish(self, completed, reason, output):
         deadline = time.monotonic()+2
         while time.monotonic() < deadline and rclpy.ok():
             self.command()
             rclpy.spin_once(self, timeout_sec=.05)
-        stopped = bool(self.odometry and all(math.isfinite(v) for v in self.odometry)
-                       and time.monotonic()-self.odometry[3] < .5
-                       and abs(self.odometry[4]) < .005 and abs(self.odometry[5]) < .02)
+        stopped = self.stationary()
         result = {'execute': self.execute, 'reason': reason,
                   'alignment_completed': completed, 'stopped_verified': stopped,
                   'first_motion_command_sent': self.first is not None,
@@ -162,6 +423,7 @@ def run_trial(cfg, execute=False, show=False, enable_camera=False, output=DEFAUL
     try:
         if enable_camera:
             node.enable_camera()
+        node.prepare_perception()
         completed = node.run()
     except (RuntimeError, KeyboardInterrupt) as exc:
         reason = str(exc) or 'User interrupted'
@@ -170,6 +432,8 @@ def run_trial(cfg, execute=False, show=False, enable_camera=False, output=DEFAUL
         try:
             stopped = node.finish(completed, reason, output)
         finally:
+            if show:
+                cv2.destroyAllWindows()
             node.destroy_node()
     if execute and not stopped:
         raise RuntimeError('Trial ended but odometry did not confirm a stop')

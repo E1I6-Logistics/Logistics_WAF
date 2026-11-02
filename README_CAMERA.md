@@ -24,7 +24,18 @@ ssh waffle@192.168.0.105
 ROS_DOMAIN_ID=11 bash /home/waffle/camera_ws/scripts/run_waffle_camera.sh
 ```
 
-`Ctrl+C`로 종료한다. 부팅 시 자동 실행은 설정하지 않았다.
+`Ctrl+C`로 종료한다. OS 부팅 서비스는 설정하지 않았다.
+
+### Waffle bringup과 별도로 실행
+
+`robot.launch.py`는 카메라를 실행하지 않는다. 카메라 자동 실행에 사용하던
+`start_camera`, `camera_script` 인자와 실행 액션은 제거했다.
+로봇 bringup은 기존 명령으로 실행하고, 영상이 필요할 때 별도 터미널에서
+위의 `run_waffle_camera.sh` 명령으로 카메라를 실행한다.
+카메라 종료는 해당 터미널에서 `Ctrl+C`로 진행한다.
+
+수동으로 카메라를 실행한 경우 정렬 명령의 `--enable-camera` 옵션은 생략한다.
+이 옵션은 별도로 실행한 카메라 관리자의 `/camera/enable` 서비스를 필요로 한다.
 
 설정 원본은 `config/waffle_camera.yaml`, 실행 스크립트는
 `scripts/run_waffle_camera.sh`이다. Pi에는 각각 `camera_ws/config`,

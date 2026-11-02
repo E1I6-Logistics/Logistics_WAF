@@ -1,11 +1,30 @@
-# Default bounded YOLO+LM alignment trial. Distances are meters.
+# Fixed-target alignment: observe while stopped, fix the pallet in odom, then
+# turn-drive-turn on odometry and re-observe. Distances are meters.
+# After verified alignment (--execute), drive straight in: gap - fork_projection + insertion_depth.
 # User confirmed mounting TF and 152mm fork projection on 2026-10-31.
-# No insertion; trial limits apply only to the alignment stage, not Nav2 travel.
+# All gaps below are measured from the body front, not from the fork tip.
+# Off-centerline: drive to this point on the centerline, or back off to
+# backoff_gap first when it cannot be reached at <= 45deg.
+staging_target_gap: 0.350
+backoff_gap: 0.410
+max_move_distance: 0.25
+max_observations: 6
+# Every stopped frame must agree with the median (odom frame).
+target_position_spread: 0.015
+target_yaw_spread_deg: 3.0
 opening_width: 0.035158
-opening_height: 0.009165
+# Effective height for the label convention: labels sit ~1px outside the
+# physical 9.165mm opening. The physical value made PnP invent ~17deg tilt.
+opening_height: 0.0105
 center_web_width: 0.021248
 target_body_gap: 0.31
 fork_projection: 0.152
+# Fork tip depth inside the opening. Internal obstacle is at 119mm.
+insertion_depth: 0.115
+# Linear actuator has no position feedback: UP/DOWN runs this long (full stroke + margin), then STOP.
+lift_time: 20.0
+# Straight reverse after lifting (rear scan corridor check applies).
+retreat_distance: 0.06
 extrinsics_verified: true
 base_frame: base_link
 body_front_x: 0.068
@@ -30,20 +49,27 @@ max_reprojection_error_px: 1.5
 max_pose_range: 1.2
 min_pose_range: 0.08
 max_pallet_yaw_deg: 35.0
+# Move planning. lateral: base_link off the entry centerline -> centerline maneuver.
+# face: fork line offset at the pallet face -> turn toward the opening center.
 lateral_tolerance: 0.008
+face_lateral_tolerance: 0.002
 gap_tolerance: 0.005
-yaw_tolerance_deg: 4.0
+yaw_tolerance_deg: 1.5
+# Verification while stopped (fork side clearance is ~4.4mm per tine).
+completion_face_lateral_tolerance: 0.004
+completion_yaw_tolerance_deg: 2.0
+completion_gap_tolerance: 0.007
 near_guard_gap: 0.32
 min_body_gap: 0.28
 max_linear_speed: 0.01
+# Long straight drives only (insertion, retreat after lift).
+insertion_speed: 0.04
 max_angular_speed: 0.05
 stable_frames: 8
 max_image_age: 0.4
 max_info_age: 2.0
 lost_timeout: 2.0
-alignment_timeout: 18.0
+alignment_timeout: 300.0
 startup_timeout: 12.0
 pose_refine_lm: true
-trial_max_motion_seconds: 3.0
-trial_max_displacement: 0.035
-trial_max_yaw_change: 0.16
+vertical_face_fit: true

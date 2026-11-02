@@ -170,6 +170,7 @@ class PalletAligner(Node):
         k, d = np.array(info.k).reshape(3, 3), np.array(info.d)
         if not np.isfinite(k).all() or not np.isfinite(d).all() or k[0, 0] <= 0 or k[1, 1] <= 0:
             raise ValueError('CameraInfo is not calibrated')
+        self.camera_model = k, d
         if info.binning_x > 1 or info.binning_y > 1 or info.roi.x_offset or info.roi.y_offset:
             raise ValueError('Binning/ROI CameraInfo is not supported by this prototype')
         image = cv2.imdecode(np.frombuffer(message.data, np.uint8), cv2.IMREAD_COLOR)
@@ -216,6 +217,7 @@ class PalletAligner(Node):
         last_valid = None
         completed_frames = 0
         last_processed = 0.0
+        reset_tracking = self.gate.reset
         self.get_logger().info('EXECUTE: alignment only, no insertion' if self.execute else
                                'OBSERVE: no navigation goal or velocity commands')
         try:
@@ -233,7 +235,7 @@ class PalletAligner(Node):
                     raise RuntimeError('Pallet pose lost; stopped')
                 if self.image is None or not self.image_fresh(*self.image):
                     self.command()
-                    self.gate.reset()
+                    reset_tracking()
                     completed_frames = 0
                     self.report('Waiting for fresh image; verify ROS_DOMAIN_ID=11 and device clocks')
                     continue
@@ -244,12 +246,12 @@ class PalletAligner(Node):
                     continue
                 if stamp < self.last_stamp:
                     self.command()
-                    self.gate.reset()
+                    reset_tracking()
                     completed_frames = 0
                     self.report('Non-monotonic image timestamp')
                     continue
                 if last_processed and now-last_processed > self.cfg['max_image_age']:
-                    self.gate.reset()
+                    reset_tracking()
                     completed_frames = 0
                 self.last_stamp = stamp
                 last_processed = now
@@ -291,7 +293,7 @@ class PalletAligner(Node):
                         return True
                 except (ValueError, cv2.error, TransformException) as error:
                     self.command()
-                    self.gate.reset()
+                    reset_tracking()
                     completed_frames = 0
                     self.report(str(error))
             raise RuntimeError('Alignment/observation timeout')

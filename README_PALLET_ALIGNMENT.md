@@ -1,4 +1,8 @@
 > 2026-10-31 업데이트: nav2_send_goal.py의 정렬 경로는 기본 config/trial.yaml과
+
+> 현재 기본 실행은 [README_PALLET_TRIAL.md](README_PALLET_TRIAL.md)를 따른다.
+> 현재 위치 시험, 310mm 목표, 단계별 정렬·후진·재접근 설정은 해당 문서에 정리되어 있다.
+> 아래의 목적지 이동 및 전진 전용 제어 설명은 기존 구현 기준이다.
 > 제한 시험 실행기로 통합됐다. 목표 310mm, YOLO+LM, 최대 3초/35mm/0.16rad가 적용된다.
 > 최신 실행 안내는 [README_PALLET_TRIAL.md](README_PALLET_TRIAL.md)를 따른다.
 > 아래 일반 정렬기·기본 contour 설정에 대한 기록과 통합 경로를 구분한다.

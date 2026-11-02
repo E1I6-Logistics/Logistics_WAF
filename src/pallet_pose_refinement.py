@@ -93,6 +93,8 @@ def accepted_refined_candidates(candidates, cfg):
              if cfg['min_pose_range'] < c['translation_m'][2] < cfg['max_pose_range']
              and c['rotation'][2][2] >= .5
              and c['rms_px'] <= cfg['max_reprojection_error_px']]
-    return [] if ambiguous_candidates(valid) else valid
+    # Mirror IPPE solutions differ mainly in tilt; the vertical-face fit removes
+    # tilt and converges to the same yaw from either seed.
+    return [] if ambiguous_candidates(valid) and not cfg.get('vertical_face_fit') else valid
 
 

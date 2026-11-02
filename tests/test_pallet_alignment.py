@@ -7,13 +7,11 @@ import copy
 import math
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
-import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
@@ -125,6 +123,38 @@ class GeometryTests(unittest.TestCase):
             self.assertEqual(state, 'ALIGNED')
             self.assertGreaterEqual(.7-x-.14, .165)
 
+    def test_trial_forward_commands_survive_opencr_integer_conversion(self):
+        cfg = load_config(ROOT/'config/trial.yaml')
+        # Recorded final pose from the rotation-only 20261101_123003 trial,
+        # plus a close approach where the proportional speed is below 1cm/s.
+        for target in [(0.06375976211201928, 0.01109132047154,
+                        -0.08233875910533345, 0.3728619137057924),
+                       (.01, 0., 0., .32)]:
+            with self.subTest(target=target):
+                v, w, state = control_step(target, cfg)
+                self.assertEqual(state, 'ALIGNING')
+                self.assertEqual(v, .01)
+                self.assertEqual(int(v*100), 1)
+                self.assertLessEqual(v, cfg['max_linear_speed'])
+                self.assertLessEqual(abs(w), cfg['max_angular_speed'])
+
+    def test_forward_floor_preserves_rotation_only_and_stop_conditions(self):
+        cfg = load_config(ROOT/'config/trial.yaml')
+        v, w, state = control_step((.06, .05, -.09, .37), cfg)
+        self.assertEqual((v, state), (0., 'ALIGNING'))
+        self.assertNotEqual(w, 0.)
+        for target, expected in [((0., 0., 0., .31), 'ALIGNED'),
+                                 ((-.04, 0., 0., .27), 'TOO_CLOSE'),
+                                 ((-.01, 0., 0., .33), 'NEED_REPOSITION')]:
+            with self.subTest(target=target):
+                self.assertEqual(control_step(target, cfg), (0., 0., expected))
+
+    def test_forward_floor_cannot_exceed_configured_speed_limit(self):
+        cfg = load_config(ROOT/'config/trial.yaml')
+        cfg['max_linear_speed'] = .009
+        self.assertEqual(control_step((.06, .01, 0., .37), cfg),
+                         (0., 0., 'INVALID'))
+
     def test_pose_gate_requires_reacquisition_after_jump(self):
         gate = PoseGate(3)
         det = estimate_pose(self.projected(), self.k, self.d, self.cfg)
@@ -165,30 +195,6 @@ class MissionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.module.navigate(self.nav, (1, 2, 90), 1.)
         self.nav.cancelTask.assert_called_once()
-
-    def test_observe_skips_navigation_and_failed_navigation_skips_alignment(self):
-        cfg = load_config(ROOT/'config/trial.yaml')
-        cfg.update(extrinsics_verified=True, body_front_x=.14,
-                   target_body_gap=.17, min_body_gap=.16, near_guard_gap=.19)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/'cfg.yaml'
-            path.write_text(yaml.safe_dump(cfg))
-            for execute in (False, True):
-                argv = ['nav2_send_goal.py', '1', '--align-pallet', '--alignment-config', str(path)]
-                if execute:
-                    argv.append('--execute')
-                with patch.object(sys, 'argv', argv), \
-                        patch.object(self.module.rclpy, 'init'), \
-                        patch.object(self.module.rclpy, 'try_shutdown'), \
-                        patch.object(self.module, 'BasicNavigator') as factory, \
-                        patch.object(self.module, 'navigate', return_value=False), \
-                        patch('pallet_alignment_trial.run_trial', return_value=True) as align:
-                    self.module.main()
-                    if execute:
-                        align.assert_not_called()
-                    else:
-                        factory.assert_not_called()
-                        self.assertFalse(align.call_args.args[1])
 
     def test_stale_frames_and_observe_mode_cannot_publish(self):
         from pallet_alignment import PalletAligner

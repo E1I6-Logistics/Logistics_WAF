@@ -183,7 +183,50 @@ def target_in_base(det, rotation, translation, cfg):
     if abs(normal[2]) > math.sin(math.radians(20)):
         raise ValueError('Pallet face is not vertical; check corners and TF')
     normal = normal[:2] / np.linalg.norm(normal[:2])
-    yaw = math.atan2(normal[1], normal[0])
+    return face_target(center, math.atan2(normal[1], normal[0]), cfg)
+
+
+# Model axes (x right, y down, z into pallet) in base axes for a vertical face at yaw 0.
+FACE_AXES = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])
+
+
+def vertical_face_target(det, k, d, rotation, translation, cfg):
+    """Refit only (x, y, z, yaw) with the face held vertical in base_link.
+
+    The 8 points barely constrain face tilt, and a free tilt trades off with yaw.
+    """
+    model, corners = opening_model(cfg), det.corners.ravel()
+
+    def residual(p):
+        c, s = math.cos(p[3]), math.sin(p[3])
+        face = model @ (np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]) @ FACE_AXES).T + p[:3]
+        # Transform explicitly: cv2.Rodrigues rounds tiny rotations to zero.
+        camera = (face-translation) @ rotation
+        return cv2.projectPoints(camera, np.zeros(3), np.zeros(3), k, d)[0].ravel()-corners
+
+    normal = rotation @ det.rotation[:, 2]
+    p = np.array([*(rotation @ det.translation + translation), math.atan2(normal[1], normal[0])])
+    r, damping = residual(p), 1e-3
+    for _ in range(30):
+        jac = np.column_stack([(residual(p+step)-r)/step.sum() for step in np.eye(4)*1e-6])
+        h = jac.T @ jac
+        trial = p-np.linalg.solve(h+damping*np.diag(np.diag(h)+1e-12), jac.T @ r)
+        r_trial = residual(trial)
+        if r_trial @ r_trial >= r @ r:
+            damping *= 10
+            continue
+        done = np.max(np.abs(trial-p)) < 1e-9
+        p, r, damping = trial, r_trial, damping*.3
+        if done:
+            break
+    rms = float(np.sqrt(np.mean(np.sum(r.reshape(-1, 2)**2, axis=1))))
+    if not np.isfinite(p).all() or rms > cfg['max_reprojection_error_px']:
+        raise ValueError(f'Vertical-face fit rejected: rms={rms:.2f}px')
+    return face_target(p[:3], float(p[3]), cfg)
+
+
+def face_target(center, yaw, cfg):
+    normal = np.array([math.cos(yaw), math.sin(yaw)])
     if center[0] <= 0 or abs(yaw) > math.radians(cfg['max_pallet_yaw_deg']):
         raise ValueError('Pallet is behind robot or too oblique')
     target = center[:2] - normal*(cfg['body_front_x']+cfg['target_body_gap'])
@@ -192,7 +235,12 @@ def target_in_base(det, rotation, translation, cfg):
 
 
 def control_step(target, cfg):
-    """Return (v, w, state). No reversing, insertion, or recovery near the pallet."""
+    """Return (v, w, state). Complete mode can align inside the near guard.
+
+    Forward-only approach: at the target distance, finish heading correction
+    without driving past the target to chase lateral error. Residual lateral
+    error is not success; the runner's no-progress watchdog handles that case.
+    """
     x, y, yaw, gap = target
     if not all(math.isfinite(v) for v in target):
         return 0.0, 0.0, 'INVALID'
@@ -201,16 +249,30 @@ def control_step(target, cfg):
         return 0.0, 0.0, 'TOO_CLOSE'
     if aligned and abs(gap-cfg['target_body_gap']) <= cfg['gap_tolerance']:
         return 0.0, 0.0, 'ALIGNED'
-    if gap <= cfg['near_guard_gap'] and not aligned:
+    complete = cfg.get('alignment_mode') == 'complete'
+    if not complete and gap <= cfg['near_guard_gap'] and not aligned:
         return 0.0, 0.0, 'NEED_REPOSITION'
+    if complete and not aligned and (x <= 0 or gap <= cfg['target_body_gap']+cfg['gap_tolerance']):
+        # Polar steering atan2(y, x) becomes singular at the docking point
+        # and can request a large turn after passing it. Use the face normal
+        # here instead, even when the desired point is slightly behind us.
+        omega = float(np.clip(1.5*yaw, -cfg['max_angular_speed'], cfg['max_angular_speed']))
+        return 0.0, omega, 'ALIGNING'
     if x <= 0:
         return 0.0, 0.0, 'NEED_REPOSITION'
     alpha = math.atan2(y, x)
     beta = math.atan2(math.sin(yaw-alpha), math.cos(yaw-alpha))
+    # Waffle transmits int32(linear.x * 100) to OpenCR. Smaller positive
+    # commands become zero; floor permitted forward motion to one unit.
+    min_forward_command = 0.01
     velocity = min(cfg['max_linear_speed'], 0.3*math.hypot(x, y))
     velocity *= max(0.0, math.cos(alpha))
-    if abs(alpha) > math.radians(35):
+    if abs(alpha) > math.radians(35) or velocity <= 0.0:
         velocity = 0.0
+    else:
+        if cfg['max_linear_speed'] < min_forward_command:
+            return 0.0, 0.0, 'INVALID'
+        velocity = max(min_forward_command, velocity)
     omega = float(np.clip(1.5*alpha-0.6*beta, -cfg['max_angular_speed'], cfg['max_angular_speed']))
     return velocity, omega, 'ALIGNING'
 
