@@ -2,6 +2,7 @@
 
 Observe mode never publishes velocity. With --execute, a verified alignment is
 followed by a straight fork insertion on odometry, a lift and a straight retreat.
+The aligned map pose and insertion travel are kept so place_pallet can return there.
 """
 import argparse
 from datetime import datetime
@@ -25,7 +26,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from tf2_ros import TransformException
 
-from pallet_alignment import PalletAligner
+from pallet_alignment import PalletAligner, camera_off
 from pallet_vision import load_config, validate_motion_config, quaternion_matrix, vertical_face_target
 from pallet_alignment_control import (aligned, alignment_errors, fixed_pallet, pallet_in_odom,
                                       plan_moves, validate_fixed_target_config, wrap_angle)
@@ -51,7 +52,7 @@ def validate_trial_config(cfg):
             raise ValueError(f'{key} must be within [0.01, {ceiling}]')
 
 
-def lift(node, command, seconds):
+def lift(node, command, seconds, cancel=None):
     """Run the linear actuator UP/DOWN for a full stroke, then STOP (no position feedback)."""
     publisher = node.create_publisher(String, '/linear_actuator/cmd', 10)
     try:
@@ -64,6 +65,8 @@ def lift(node, command, seconds):
         publisher.publish(String(data=command))
         until = time.monotonic()+seconds
         while time.monotonic() < until:
+            if cancel and cancel():
+                raise RuntimeError('Canceled')
             rclpy.spin_once(node, timeout_sec=.05)
     finally:
         publisher.publish(String(data='STOP'))
@@ -84,6 +87,8 @@ class Trial(PalletAligner):
         self.output_velocity = None
         self.scan = None
         self.min_stamp = 0
+        self.cancel = None
+        self.placement = None
         self.create_subscription(LaserScan, '/scan', self.receive_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.receive_odom, qos_profile_sensor_data)
         self.create_subscription(SensorState, '/sensor_state', self.receive_sensor, qos_profile_sensor_data)
@@ -149,6 +154,15 @@ class Trial(PalletAligner):
         if np.any(blocked):
             raise RuntimeError('Backoff blocked by rear obstacle')
 
+    def map_pose(self):
+        """base_frame (x, y, yaw) in map from AMCL's TF."""
+        try:
+            transform = self.tf_buffer.lookup_transform('map', self.cfg['base_frame'], Time()).transform
+        except TransformException as exc:
+            raise RuntimeError('Map pose requires map-to-base TF (AMCL)') from exc
+        p, q = transform.translation, transform.rotation
+        return p.x, p.y, math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
+
     def prepare_perception(self):
         """Pay cold inference/GUI costs before creating a velocity publisher.
 
@@ -181,7 +195,26 @@ class Trial(PalletAligner):
             return
         raise RuntimeError(f'Perception preparation timed out: {last_error}')
 
+    def link_fresh(self):
+        now = time.monotonic()
+        return bool(self.odometry and now-self.odometry[3] <= .5 and self.sensor and now-self.sensor[1] <= .5)
+
+    def wait_for_link(self):
+        """Brief Wi-Fi/DDS dropouts: hold zero commands up to 2s for fresh odom/sensor state, then resume."""
+        if self.odometry is None or self.link_fresh():
+            return
+        self.get_logger().warning('Odometry/sensor state stale: holding zero command up to 2s')
+        started = time.monotonic()
+        while time.monotonic()-started < 2:
+            super().command()
+            rclpy.spin_once(self, timeout_sec=.02)
+            if self.link_fresh():
+                self.records.append({'t': time.monotonic()-self.start_time, 'link_pause': time.monotonic()-started})
+                self.get_logger().info(f'Link recovered after {time.monotonic()-started:.2f}s; resuming')
+                return
+
     def motion_guard(self):
+        self.wait_for_link()
         now = time.monotonic()
         if not self.odometry or not all(math.isfinite(v) for v in self.odometry) or now-self.odometry[3] > .5:
             raise RuntimeError('Odometry unavailable, invalid or stale')
@@ -226,6 +259,8 @@ class Trial(PalletAligner):
         super().preflight_motion()
 
     def chain_active(self):
+        if self.cancel and self.cancel():
+            raise RuntimeError('Canceled')
         # Check sensors even without a new detection.
         if self.execute:
             self.motion_guard()
@@ -363,11 +398,14 @@ class Trial(PalletAligner):
                     if self.execute:
                         # Straight in on odometry; the camera cannot see the openings this close.
                         travel = gap-self.cfg['fork_projection']+self.cfg['insertion_depth']
+                        # Kept for place_pallet; map (AMCL), since odom drifts over later trips.
+                        self.placement = {'pose': self.map_pose(), 'travel': travel}
                         self.get_logger().info(f'Inserting forks: straight {travel*1000:.0f}mm forward')
-                        self.records.append({'t': time.monotonic()-self.start_time, 'insertion_travel': travel})
+                        self.records.append({'t': time.monotonic()-self.start_time, 'insertion_travel': travel,
+                                             'placement': self.placement})
                         speed = self.cfg['insertion_speed']
                         self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
-                        lift(self, 'UP', self.cfg['lift_time'])
+                        lift(self, 'UP', self.cfg['lift_time'], self.cancel)
                         # Lifecycle polling pauses during the lift; refresh it before moving again.
                         until = time.monotonic()+3
                         while not self.chain_active():
@@ -387,6 +425,51 @@ class Trial(PalletAligner):
                 for kind, value in moves:
                     self.move(kind, value, deadline)
             raise RuntimeError('Alignment not verified within max_observations')
+        finally:
+            for _ in range(3):
+                self.command()
+                time.sleep(.03)
+
+    def place(self, placement):
+        """Correct onto the saved aligned map pose, then drive the saved insertion travel."""
+        self.get_logger().info('EXECUTE: return to saved alignment pose, straight in to place')
+        try:
+            self.preflight_motion()
+            deadline = time.monotonic()+self.cfg['alignment_timeout']
+            tx, ty, tyaw = placement['pose']
+            for correction in range(1, 4):
+                x, y, yaw = self.map_pose()
+                c, s = math.cos(yaw), math.sin(yaw)
+                ahead, side = c*(tx-x)+s*(ty-y), -s*(tx-x)+c*(ty-y)
+                heading = wrap_angle(tyaw-yaw)
+                self.records.append({'t': time.monotonic()-self.start_time, 'correction': correction,
+                                     'map_pose': (x, y, yaw), 'ahead': ahead, 'side': side, 'heading': heading})
+                self.get_logger().info(f'Correction {correction}: ahead={ahead*1000:+.1f}mm, '
+                                       f'side={side*1000:+.1f}mm, heading={math.degrees(heading):+.2f}deg')
+                if (abs(side) <= self.cfg['lateral_tolerance']
+                        and abs(heading) <= math.radians(self.cfg['yaw_tolerance_deg'])):
+                    break
+                distance = math.hypot(ahead, side)
+                if distance > self.cfg['max_move_distance']:
+                    raise RuntimeError('Saved pose is farther than max_move_distance; check AMCL')
+                odom_yaw = self.odometry[2]
+                if abs(side) > self.cfg['lateral_tolerance']:
+                    # Turn at most 90deg toward (or away from) the saved point and drive straight onto it.
+                    bearing = math.atan2(side, ahead)
+                    if abs(bearing) > math.pi/2:
+                        bearing, distance = wrap_angle(bearing+math.pi), -distance
+                    self.move('turn', wrap_angle(odom_yaw+bearing), deadline)
+                    self.move('drive', distance, deadline)
+                self.move('turn', wrap_angle(odom_yaw+heading), deadline)
+            else:
+                raise RuntimeError('Saved pose not reached within 3 corrections')
+            # Remaining along-heading offset is folded into the straight travel.
+            travel = placement['travel']+ahead
+            self.get_logger().info(f'Placing: straight {travel*1000:.0f}mm forward')
+            self.records.append({'t': time.monotonic()-self.start_time, 'placement_travel': travel})
+            speed = self.cfg['insertion_speed']
+            self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
+            return True
         finally:
             for _ in range(3):
                 self.command()
@@ -416,15 +499,44 @@ class Trial(PalletAligner):
         return stopped
 
 
-def run_trial(cfg, execute=False, show=False, enable_camera=False, output=DEFAULT_OUTPUT):
+def run_trial(cfg, execute=False, show=False, enable_camera=False, output=DEFAULT_OUTPUT, cancel=None,
+              placement=None):
+    """placement (dict), if given, receives the aligned map pose and insertion travel.
+
+    enable_camera: on before alignment, off when it ends (success, failure or Ctrl+C);
+    navigation in between needs no camera.
+    """
     validate_trial_config(cfg)
     node = Trial(cfg, execute, show)
-    completed, reason, stopped = False, '', False
-    try:
+    node.cancel = cancel
+
+    def work():
         if enable_camera:
             node.enable_camera()
         node.prepare_perception()
         completed = node.run()
+        if placement is not None and node.placement:
+            placement.update(node.placement)
+        return completed
+    try:
+        return finish_run(node, work, execute, show, output)
+    finally:
+        if enable_camera:
+            camera_off(cfg)
+
+
+def place_pallet(cfg, placement, output=DEFAULT_OUTPUT, cancel=None):
+    """Drive back onto a run_trial placement and straight in; the caller lowers the lift."""
+    validate_trial_config(cfg)
+    node = Trial(cfg, True)
+    node.cancel = cancel
+    return finish_run(node, lambda: node.place(placement), True, False, output)
+
+
+def finish_run(node, work, execute, show, output):
+    completed, reason, stopped = False, '', False
+    try:
+        completed = work()
     except (RuntimeError, KeyboardInterrupt) as exc:
         reason = str(exc) or 'User interrupted'
         raise

@@ -36,6 +36,33 @@ def wait_result(node, future, seconds=3.0):
     return future.result()
 
 
+def set_camera(node, service, enable):
+    """Start/stop the camera through the Waffle camera manager's SetBool service."""
+    client = node.create_client(SetBool, service)
+    try:
+        if not client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError('Camera manager is unavailable; run it on Waffle first')
+        request = SetBool.Request()
+        request.data = enable
+        response = wait_result(node, client.call_async(request), 5.0)
+        if not response.success:
+            raise RuntimeError(response.message)
+        node.get_logger().info(f'Camera: {response.message}')
+    finally:
+        node.destroy_client(client)
+
+
+def camera_off(cfg):
+    """End-of-run stop for a manager-owned camera; a failure only warns."""
+    node = rclpy.create_node('camera_off')
+    try:
+        set_camera(node, cfg['camera_enable_service'], False)
+    except RuntimeError as error:
+        node.get_logger().warning(f'Camera off failed: {error}')
+    finally:
+        node.destroy_node()
+
+
 class PalletAligner(Node):
     def __init__(self, cfg, execute=False, show=False):
         super().__init__('pallet_alignment_test')
@@ -70,18 +97,7 @@ class PalletAligner(Node):
         self.info_received = time.monotonic()
 
     def enable_camera(self):
-        client = self.create_client(SetBool, self.cfg['camera_enable_service'])
-        try:
-            if not client.wait_for_service(timeout_sec=5.0):
-                raise RuntimeError('Camera manager is unavailable; run it on Waffle first')
-            request = SetBool.Request()
-            request.data = True
-            response = wait_result(self, client.call_async(request), 5.0)
-            if not response.success:
-                raise RuntimeError(response.message)
-            self.get_logger().info(f'Camera: {response.message}')
-        finally:
-            self.destroy_client(client)
+        set_camera(self, self.cfg['camera_enable_service'], True)
 
     def preflight_motion(self):
         """Read live configuration; never change Nav2 or bypass its collision checks."""

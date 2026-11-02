@@ -8,7 +8,7 @@
 staging_target_gap: 0.350
 backoff_gap: 0.410
 max_move_distance: 0.25
-max_observations: 6
+max_observations: 10
 # Every stopped frame must agree with the median (odom frame).
 target_position_spread: 0.015
 target_yaw_spread_deg: 3.0

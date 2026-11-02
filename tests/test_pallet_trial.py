@@ -24,6 +24,7 @@ class TrialTests(unittest.TestCase):
         node.sensor = (SimpleNamespace(torque=True), 100.)
         node.statuses = {}
         node.get_publishers_info_by_topic = lambda _: []
+        node.wait_for_link = lambda: None  # Pause needs a live clock/executor.
         node.first = None
         node.origin = None
         node.execute = True
@@ -47,8 +48,9 @@ class TrialTests(unittest.TestCase):
 
     def test_runner_cleanup_camera_and_stop_result(self):
         node = MagicMock();node.run.return_value = True;node.finish.return_value = True
-        with patch.object(trial,'Trial',return_value=node):
+        with patch.object(trial,'Trial',return_value=node),patch.object(trial,'camera_off') as off:
             self.assertTrue(trial.run_trial(self.cfg,True,False,True))
+        off.assert_called_once_with(self.cfg)
         node.enable_camera.assert_called_once()
         node.prepare_perception.assert_called_once()
         self.assertLess(node.mock_calls.index(call.prepare_perception()),

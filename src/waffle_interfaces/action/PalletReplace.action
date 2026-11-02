@@ -1,0 +1,11 @@
+# Goal: pick-up destination number in nav2_send_goal.DESTINATIONS.
+# Drop-off (destination 2), second pick-up (destination 3) and return (destination 4) are fixed;
+# the second pallet is placed at the first pallet's aligned pose.
+int32 destination
+---
+bool success
+string message
+---
+# NAV_TO_PICK, ALIGN (alignment, insertion, lift up, retreat), NAV_TO_DROP, LIFT_DOWN, BACKUP,
+# NAV_TO_PICK_2, ALIGN_2, NAV_TO_PLACE, PLACE (pose correction, straight in), LIFT_DOWN_2, BACKUP_2, NAV_TO_HOME
+string stage
