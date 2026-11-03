@@ -36,7 +36,7 @@ DEFAULT_CONFIG = ROOT / 'config/trial.yaml'
 DEFAULT_OUTPUT = ROOT / 'output/pallet_alignment_trials'
 # Longest Wi-Fi/DDS dropout ridden out at zero velocity before aborting (odom/sensor state, rear scan).
 LINK_WAIT = 5.
-INSERT_LIFT_DOWN = 6.  # s of lift DOWN while stopped right before the insertion drive
+INSERT_LIFT_DOWN = 8.  # s of lift DOWN while stopped right before the insertion drive
 
 
 def validate_trial_config(cfg):

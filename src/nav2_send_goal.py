@@ -28,7 +28,7 @@ LOCALIZE_SEARCH = (0.30, math.radians(30))  # +-position (m), +-heading searched
 LOCALIZE_MIN_SCORE = 0.5  # mean scan-to-wall match (0..1) required to move
 NAV_RETRIES = 3  # retries after a Nav2 FAILED result or a sensor/TF dropout
 BACKUP_DISTANCE = 0.15
-NAV_LIFT_UP = 5.0  # s of lift UP while stopped before each Nav2 move
+NAV_LIFT_UP = 7.0  # s of lift UP while stopped before each Nav2 move
 
 
 class LinkTimeout(RuntimeError):
