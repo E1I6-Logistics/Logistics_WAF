@@ -3,10 +3,17 @@ import argparse
 from pathlib import Path
 import time
 
+import cv2
+import numpy as np
 import rclpy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
-from geometry_msgs.msg import PoseStamped
+from rclpy.time import Time
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from tf2_ros import Buffer, TransformListener
 
 DESTINATIONS = {
     1: (0.512388313505402, -0.0015077706338736544, 270),
@@ -16,8 +23,94 @@ DESTINATIONS = {
     4: (1.905751886319870, -0.23540788720650954, 180)
 }
 
+# Scan-to-map correction before each Nav2 move (replaces RViz 2D Pose Estimate).
+LOCALIZE_SEARCH = (0.30, math.radians(30))  # +-position (m), +-heading searched around AMCL's pose
+LOCALIZE_MIN_SCORE = 0.5  # mean scan-to-wall match (0..1) required to move
+
+
+def yaw_of(q):
+    return math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
+
+
+def match_scan(grid, points, pose):
+    """Best (score, x, y, yaw) for base-frame scan points on the map near pose, and pose's own score."""
+    info, res = grid.info, grid.info.resolution
+    cells = np.asarray(grid.data, np.int16).reshape(info.height, info.width)
+    distance = cv2.distanceTransform(np.where(cells >= 65, 0, 255).astype(np.uint8), cv2.DIST_L2, 5)*res
+    field = np.exp(-distance**2/(2*.05**2))
+    px, py = points
+
+    def score(x, y, yaw):
+        c, s = np.cos(yaw)[..., None], np.sin(yaw)[..., None]
+        col = np.floor((x[..., None]+c*px-s*py-info.origin.position.x)/res).astype(int)
+        row = np.floor((y[..., None]+s*px+c*py-info.origin.position.y)/res).astype(int)
+        inside = (col >= 0) & (col < info.width) & (row >= 0) & (row < info.height)
+        return np.where(inside, field[row.clip(0, info.height-1), col.clip(0, info.width-1)], 0).mean(-1)
+
+    best = (-1., *pose)
+    for reach, angle, step, turn in ((LOCALIZE_SEARCH[0], LOCALIZE_SEARCH[1], .02, math.radians(1)),
+                                     (.02, math.radians(1), .005, math.radians(.2))):
+        _, bx, by, byaw = best
+        offsets = np.arange(-reach, reach+step/2, step)
+        x, y = np.meshgrid(bx+offsets, by+offsets)
+        for yaw in byaw+np.arange(-angle, angle+turn/2, turn):
+            values = score(x, y, np.full(x.shape, yaw))
+            i = np.unravel_index(values.argmax(), values.shape)
+            if values[i] > best[0]:
+                best = (float(values[i]), float(x[i]), float(y[i]), float(yaw))
+    return best, float(score(np.array(pose[0]), np.array(pose[1]), np.array(pose[2])))
+
+
 class ExistingPoseNavigator(BasicNavigator):
     """Use AMCL's existing localization without republishing an initial pose."""
+
+    def __init__(self):
+        super().__init__()
+        self.map_msg = self.scan_msg = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             reliability=ReliabilityPolicy.RELIABLE)
+        self.create_subscription(OccupancyGrid, 'map', lambda m: setattr(self, 'map_msg', m), latched)
+        self.create_subscription(LaserScan, 'scan', lambda m: setattr(self, 'scan_msg', m), qos_profile_sensor_data)
+
+    def localize(self):
+        """Match the stopped robot's scan to the map around AMCL's pose; reset AMCL to the best fit."""
+        self.scan_msg = None
+        deadline = time.monotonic()+5
+        while (self.map_msg is None or self.scan_msg is None
+               or not self.tf_buffer.can_transform('map', 'base_footprint', Time())
+               or not self.tf_buffer.can_transform('base_footprint', self.scan_msg.header.frame_id, Time())):
+            if time.monotonic() > deadline:
+                raise RuntimeError('Localization needs /map, /scan and map->base_footprint TF')
+            rclpy.spin_once(self, timeout_sec=.1)
+        scan = self.scan_msg
+        robot = self.tf_buffer.lookup_transform('map', 'base_footprint', Time()).transform
+        sensor = self.tf_buffer.lookup_transform('base_footprint', scan.header.frame_id, Time()).transform
+        ranges = np.asarray(scan.ranges, float)
+        angles = scan.angle_min+np.arange(len(ranges))*scan.angle_increment+yaw_of(sensor.rotation)
+        valid = np.isfinite(ranges) & (ranges > scan.range_min) & (ranges < scan.range_max)
+        ranges, angles = ranges[valid], angles[valid]
+        points = (sensor.translation.x+ranges*np.cos(angles), sensor.translation.y+ranges*np.sin(angles))
+        pose = (robot.translation.x, robot.translation.y, yaw_of(robot.rotation))
+        (best, x, y, yaw), current = match_scan(self.map_msg, points, pose)
+        self.info(f'Localization: match {current:.2f} -> {best:.2f}, shift '
+                  f'({x-pose[0]:+.3f}, {y-pose[1]:+.3f})m {math.degrees(yaw-pose[2]):+.1f}deg')
+        if best < LOCALIZE_MIN_SCORE:
+            raise RuntimeError(f'위치 추정 실패: 스캔-지도 일치 {best:.2f} < {LOCALIZE_MIN_SCORE}. '
+                               '로봇을 초기 위치 근처에 두거나 RViz 2D Pose Estimate로 설정하세요.')
+        message = PoseWithCovarianceStamped()
+        message.header.frame_id = 'map'
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.pose.pose.position.x, message.pose.pose.position.y = x, y
+        message.pose.pose.orientation.z, message.pose.pose.orientation.w = math.sin(yaw/2), math.cos(yaw/2)
+        message.pose.covariance[0] = message.pose.covariance[7] = .05**2
+        message.pose.covariance[35] = math.radians(3)**2
+        self.initial_pose_pub.publish(message)
+        # Let AMCL apply the reset and update map->odom before planning.
+        until = time.monotonic()+1
+        while time.monotonic() < until:
+            rclpy.spin_once(self, timeout_sec=.1)
 
     def _waitForInitialPose(self):
         # Jazzy BasicNavigator publishes its default pose before spinning here.
@@ -38,6 +131,7 @@ class ExistingPoseNavigator(BasicNavigator):
 def navigate(nav, target, timeout, cancel=None):
     x, y, yaw = target
     nav.waitUntilNav2Active()
+    nav.localize()
     goal_pose = PoseStamped()
     goal_pose.header.frame_id = 'map'
     goal_pose.header.stamp = nav.get_clock().now().to_msg()

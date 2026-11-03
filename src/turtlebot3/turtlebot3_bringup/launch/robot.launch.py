@@ -21,7 +21,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.actions import ExecuteProcess
 from launch.actions import IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.substitutions import ThisLaunchFileDir
@@ -96,6 +98,22 @@ def generate_launch_description():
             'namespace',
             default_value=namespace,
             description='Namespace for nodes'),
+
+        DeclareLaunchArgument(
+            'start_camera',
+            default_value='true' if TURTLEBOT3_MODEL in ('waffle', 'waffle_pi') else 'false',
+            description='Start the calibrated Pi camera with bringup'),
+
+        DeclareLaunchArgument(
+            'camera_script',
+            default_value=os.path.expanduser('~/camera_ws/scripts/run_waffle_camera.sh'),
+            description='Path to the Raspberry Pi camera startup script'),
+
+        ExecuteProcess(
+            cmd=['bash', LaunchConfiguration('camera_script')],
+            additional_env={'ROS_DOMAIN_ID': '11'},
+            condition=IfCondition(LaunchConfiguration('start_camera')),
+            output='screen'),
 
         PushRosNamespace(namespace),
 

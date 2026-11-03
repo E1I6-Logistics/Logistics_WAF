@@ -42,7 +42,11 @@ ros2 launch turtlebot3_navigation2 navigation2.launch.py \
 
 `waffle_real_nav.yaml`은 기존 Waffle 설정을 복사하고 `waypoint_follower.stop_on_failure`만 `true`로 바꾼 것이다. 실패한 경유점에서 경로 실행을 중단한다. 속도·footprint·센서값은 기존 설정 그대로이며 실물에 대한 튜닝 또는 검증을 마친 설정은 아니다. 이미 Nav2가 실행 중인 로봇을 사용한다면 중복 실행하지 말고, 그 Nav2에 같은 옵션이 적용됐는지 확인한다.
 
-RViz의 **2D Pose Estimate**로 로봇의 실제 위치와 방향을 지정하고, LaserScan이 지도 벽과 맞는지 확인한다. AMCL 메시지 수신만으로 위치 정확도를 판정할 수 없으므로 이 확인이 필요하다. 최초 시험은 로봇 주변의 빈 공간과 짧은 목표 거리로 진행한다.
+AMCL은 `waffle_real_nav.yaml`의 `initial_pose`(목적지 4)에서 시작한다. `nav2_send_goal.py`와 액션 서버는
+Nav2 이동 직전마다 정지 상태의 `/scan`을 지도 벽에 맞춰(현재 AMCL 위치 기준 ±0.3m, ±30° 탐색) 가장 잘 맞는
+위치를 `/initialpose`로 다시 설정하므로 RViz **2D Pose Estimate**가 필요 없다. 따라서 로봇은 초기 위치에서
+0.3m·30° 안에 두고 시작한다. 일치 점수(0~1, 로그 `Localization: match a -> b`)가 0.5 미만이면 이동하지 않고
+중단하며, 이때만 로봇 위치를 옮기거나 2D Pose Estimate로 설정한다. 최초 시험은 로봇 주변의 빈 공간과 짧은 목표 거리로 진행한다.
 
 ### Keepout 마스크 발행
 
