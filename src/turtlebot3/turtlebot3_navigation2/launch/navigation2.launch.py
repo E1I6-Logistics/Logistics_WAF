@@ -87,6 +87,11 @@ def generate_launch_description():
             default_value='false',
             description='Use simulation (Gazebo) clock if true'),
 
+        DeclareLaunchArgument(
+            'use_logitle_pose',
+            default_value='true',
+            description='Publish map -> base_footprint as /logitle_pose'),
+
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([nav2_launch_file_dir, '/bringup_launch.py']),
             launch_arguments={
@@ -102,6 +107,21 @@ def generate_launch_description():
             arguments=['-d', rviz_config_dir],
             parameters=[{'use_sim_time': use_sim_time}],
             output='screen'),
+
+        Node(
+            condition=IfCondition(LaunchConfiguration('use_logitle_pose')),
+            package='logitle_pose',
+            executable='logitle_pose_publisher',
+            name='logitle_pose_publisher',
+            output='screen',
+            parameters=[{
+                'target_frame': 'map',
+                'source_frame': 'base_footprint',
+                'publish_rate_hz': 5.0,
+                'topic_name': 'logitle_pose',
+                'use_sim_time': use_sim_time,
+            }],
+        ),
 
         Node(
             condition=has_mask,

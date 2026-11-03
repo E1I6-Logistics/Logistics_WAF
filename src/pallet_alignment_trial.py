@@ -34,6 +34,9 @@ from pallet_alignment_control import (aligned, alignment_errors, fixed_pallet, p
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / 'config/trial.yaml'
 DEFAULT_OUTPUT = ROOT / 'output/pallet_alignment_trials'
+# Longest Wi-Fi/DDS dropout ridden out at zero velocity before aborting (odom/sensor state, rear scan).
+LINK_WAIT = 5.
+INSERT_LIFT_DOWN = 6.  # s of lift DOWN while stopped right before the insertion drive
 
 
 def validate_trial_config(cfg):
@@ -89,6 +92,7 @@ class Trial(PalletAligner):
         self.min_stamp = 0
         self.cancel = None
         self.placement = None
+        self.link_resumed = 0.
         self.create_subscription(LaserScan, '/scan', self.receive_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self.receive_odom, qos_profile_sensor_data)
         self.create_subscription(SensorState, '/sensor_state', self.receive_sensor, qos_profile_sensor_data)
@@ -115,17 +119,30 @@ class Trial(PalletAligner):
     def receive_scan(self, msg):
         self.scan = msg, time.monotonic()
 
+    def scan_fresh(self):
+        """Received within 0.3s and stamped within 0.3s of now."""
+        if self.scan is None or time.monotonic()-self.scan[1] > .3:
+            return False
+        age = (self.get_clock().now().nanoseconds-Time.from_msg(self.scan[0].header.stamp).nanoseconds)*1e-9
+        return -.05 <= age <= .3
+
     def check_reverse_clearance(self):
         """Additional rear check; commands still pass through collision_monitor."""
-        if self.scan is None or time.monotonic()-self.scan[1] > .3:
-            raise RuntimeError('Backoff requires fresh rear LaserScan')
+        if not self.scan_fresh():
+            # Never reverse on an old scan: hold zero and wait out a dropout instead of aborting.
+            self.get_logger().warning(f'Rear LaserScan stale: holding zero command up to {LINK_WAIT:.0f}s')
+            started = time.monotonic()
+            while not self.scan_fresh():
+                if time.monotonic()-started > LINK_WAIT:
+                    raise RuntimeError('Backoff requires fresh rear LaserScan')
+                super().command()
+                rclpy.spin_once(self, timeout_sec=.02)
+            self.link_resumed = time.monotonic()
+            self.records.append({'t': time.monotonic()-self.start_time, 'scan_pause': time.monotonic()-started})
         scan = self.scan[0]
         if (not all(math.isfinite(v) for v in (scan.angle_min, scan.angle_increment, scan.range_min, scan.range_max))
                 or scan.angle_increment == 0 or not 0 <= scan.range_min < scan.range_max):
             raise RuntimeError('Backoff LaserScan metadata is invalid')
-        age = (self.get_clock().now().nanoseconds-Time.from_msg(scan.header.stamp).nanoseconds)*1e-9
-        if not -.05 <= age <= .3:
-            raise RuntimeError('Backoff LaserScan timestamp is stale')
         try:
             tf = self.tf_buffer.lookup_transform(self.cfg['base_frame'], scan.header.frame_id,
                                                 Time.from_msg(scan.header.stamp)).transform
@@ -200,15 +217,17 @@ class Trial(PalletAligner):
         return bool(self.odometry and now-self.odometry[3] <= .5 and self.sensor and now-self.sensor[1] <= .5)
 
     def wait_for_link(self):
-        """Brief Wi-Fi/DDS dropouts: hold zero commands up to 2s for fresh odom/sensor state, then resume."""
+        """Wi-Fi/DDS dropouts: hold zero commands up to LINK_WAIT for fresh odom/sensor state, then resume."""
         if self.odometry is None or self.link_fresh():
             return
-        self.get_logger().warning('Odometry/sensor state stale: holding zero command up to 2s')
+        self.get_logger().warning(f'Odometry/sensor state stale: holding zero command up to {LINK_WAIT:.0f}s')
         started = time.monotonic()
-        while time.monotonic()-started < 2:
+        while time.monotonic()-started < LINK_WAIT:
             super().command()
             rclpy.spin_once(self, timeout_sec=.02)
             if self.link_fresh():
+                # The pause is not a drive stall; move() restarts its stall timer from here.
+                self.link_resumed = time.monotonic()
                 self.records.append({'t': time.monotonic()-self.start_time, 'link_pause': time.monotonic()-started})
                 self.get_logger().info(f'Link recovered after {time.monotonic()-started:.2f}s; resuming')
                 return
@@ -362,7 +381,7 @@ class Trial(PalletAligner):
                 # Blocked (e.g. a fork against the pallet, or collision_monitor): stop, don't push.
                 if travelled > best+.001:
                     best, best_time = travelled, time.monotonic()
-                elif time.monotonic()-best_time > 3.:
+                elif time.monotonic()-max(best_time, self.link_resumed) > 3.:
                     raise RuntimeError(f'Drive stalled after {travelled*1000:.0f}mm of {abs(value)*1000:.0f}mm')
                 self.command(math.copysign(linear, value), 0.)
         since = None
@@ -404,14 +423,9 @@ class Trial(PalletAligner):
                         self.records.append({'t': time.monotonic()-self.start_time, 'insertion_travel': travel,
                                              'placement': self.placement})
                         speed = self.cfg['insertion_speed']
+                        self.lift_stopped('DOWN', INSERT_LIFT_DOWN)
                         self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
-                        lift(self, 'UP', self.cfg['lift_time'], self.cancel)
-                        # Lifecycle polling pauses during the lift; refresh it before moving again.
-                        until = time.monotonic()+3
-                        while not self.chain_active():
-                            if time.monotonic() > until:
-                                raise RuntimeError('Velocity smoother/collision monitor state lost')
-                            rclpy.spin_once(self, timeout_sec=.05)
+                        self.lift_stopped('UP', self.cfg['lift_time'])
                         retreat = self.cfg['retreat_distance']
                         self.get_logger().info(f'Retreating straight {retreat*1000:.0f}mm')
                         self.move('drive', -retreat, time.monotonic()+retreat/speed+30, speed)
@@ -429,6 +443,15 @@ class Trial(PalletAligner):
             for _ in range(3):
                 self.command()
                 time.sleep(.03)
+
+    def lift_stopped(self, command, seconds):
+        lift(self, command, seconds, self.cancel)
+        # Lifecycle polling pauses during the lift; refresh it before moving again.
+        until = time.monotonic()+3
+        while not self.chain_active():
+            if time.monotonic() > until:
+                raise RuntimeError('Velocity smoother/collision monitor state lost')
+            rclpy.spin_once(self, timeout_sec=.05)
 
     def place(self, placement):
         """Correct onto the saved aligned map pose, then drive the saved insertion travel."""

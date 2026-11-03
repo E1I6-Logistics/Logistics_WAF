@@ -174,6 +174,9 @@ class MissionTests(unittest.TestCase):
         self.nav = MagicMock()
         from builtin_interfaces.msg import Time
         self.nav.get_clock().now().to_msg.return_value = Time()
+        lift = patch('pallet_alignment_trial.lift')  # No actuator in offline tests.
+        lift.start()
+        self.addCleanup(lift.stop)
 
     def test_rejected_and_failed_goals_do_not_report_success(self):
         self.nav.goToPose.return_value = False

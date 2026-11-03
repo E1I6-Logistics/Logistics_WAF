@@ -23,7 +23,7 @@ launch 소스를 수정한 뒤에는 PC 작업 공간에서 패키지를 다시 
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd /home/sojeong/turtlebot3_ws
-colcon build --packages-select turtlebot3_navigation2
+colcon build --packages-select logitle_pose turtlebot3_navigation2
 ```
 
 ```bash
@@ -46,7 +46,9 @@ AMCL은 `waffle_real_nav.yaml`의 `initial_pose`(목적지 4)에서 시작한다
 Nav2 이동 직전마다 정지 상태의 `/scan`을 지도 벽에 맞춰(현재 AMCL 위치 기준 ±0.3m, ±30° 탐색) 가장 잘 맞는
 위치를 `/initialpose`로 다시 설정하므로 RViz **2D Pose Estimate**가 필요 없다. 따라서 로봇은 초기 위치에서
 0.3m·30° 안에 두고 시작한다. 일치 점수(0~1, 로그 `Localization: match a -> b`)가 0.5 미만이면 이동하지 않고
-중단하며, 이때만 로봇 위치를 옮기거나 2D Pose Estimate로 설정한다. 최초 시험은 로봇 주변의 빈 공간과 짧은 목표 거리로 진행한다.
+중단하며, 이때만 로봇 위치를 옮기거나 2D Pose Estimate로 설정한다. 재설정 후 AMCL이 5초 안에 스캔을 처리하지 못하는
+것이 마지막 재시도까지 이어지면 경고만 남기고 그대로 이동 목표를 보낸다. 또한 매 Nav2 이동 직전 정지 상태에서
+리프트업을 5초 보낸다. 최초 시험은 로봇 주변의 빈 공간과 짧은 목표 거리로 진행한다.
 
 ### Keepout 마스크 발행
 

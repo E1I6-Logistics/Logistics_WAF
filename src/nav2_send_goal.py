@@ -26,6 +26,17 @@ DESTINATIONS = {
 # Scan-to-map correction before each Nav2 move (replaces RViz 2D Pose Estimate).
 LOCALIZE_SEARCH = (0.30, math.radians(30))  # +-position (m), +-heading searched around AMCL's pose
 LOCALIZE_MIN_SCORE = 0.5  # mean scan-to-wall match (0..1) required to move
+NAV_RETRIES = 3  # retries after a Nav2 FAILED result or a sensor/TF dropout
+BACKUP_DISTANCE = 0.15
+NAV_LIFT_UP = 5.0  # s of lift UP while stopped before each Nav2 move
+
+
+class LinkTimeout(RuntimeError):
+    """Sensor/TF data did not arrive in time (Wi-Fi/DDS dropout); safe to retry."""
+
+
+class AmclTimeout(LinkTimeout):
+    """AMCL took the reset pose but processed no scan in time; the goal may still be sent."""
 
 
 def yaw_of(q):
@@ -66,7 +77,7 @@ class ExistingPoseNavigator(BasicNavigator):
 
     def __init__(self):
         super().__init__()
-        self.map_msg = self.scan_msg = None
+        self.map_msg = self.scan_msg = self.amcl_stamp = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -82,7 +93,7 @@ class ExistingPoseNavigator(BasicNavigator):
                or not self.tf_buffer.can_transform('map', 'base_footprint', Time())
                or not self.tf_buffer.can_transform('base_footprint', self.scan_msg.header.frame_id, Time())):
             if time.monotonic() > deadline:
-                raise RuntimeError('Localization needs /map, /scan and map->base_footprint TF')
+                raise LinkTimeout('Localization needs /map, /scan and map->base_footprint TF')
             rclpy.spin_once(self, timeout_sec=.1)
         scan = self.scan_msg
         robot = self.tf_buffer.lookup_transform('map', 'base_footprint', Time()).transform
@@ -106,15 +117,27 @@ class ExistingPoseNavigator(BasicNavigator):
         message.pose.pose.orientation.z, message.pose.pose.orientation.w = math.sin(yaw/2), math.cos(yaw/2)
         message.pose.covariance[0] = message.pose.covariance[7] = .05**2
         message.pose.covariance[35] = math.radians(3)**2
+        self.amcl_stamp = None
         self.initial_pose_pub.publish(message)
-        # Let AMCL apply the reset and update map->odom before planning.
-        until = time.monotonic()+1
-        while time.monotonic() < until:
+        # Plan only once AMCL has processed a scan since the reset and map->odom is fresh;
+        # a /scan dropout here otherwise aborts the controller on a stale map->odom.
+        reset = Time.from_msg(message.header.stamp)
+        deadline = time.monotonic()+5
+        while True:
             rclpy.spin_once(self, timeout_sec=.1)
+            if self.amcl_stamp is not None and self.amcl_stamp > reset:
+                stamp = self.tf_buffer.lookup_transform('map', 'odom', Time()).header.stamp
+                if (self.get_clock().now()-Time.from_msg(stamp)).nanoseconds < 2e8:
+                    return
+            if time.monotonic() > deadline:
+                raise AmclTimeout('AMCL did not refresh map->odom within 5s of the reset (check /scan)')
+
+    def _amclPoseCallback(self, msg):
+        self.amcl_stamp = Time.from_msg(msg.header.stamp)
+        super()._amclPoseCallback(msg)
 
     def _waitForInitialPose(self):
         # Jazzy BasicNavigator publishes its default pose before spinning here.
-        # A subscriber discovery delay must not reset AMCL's existing estimate.
         deadline = time.monotonic() + 30.0
         if not self.initial_pose_received:
             self.info('Waiting for existing AMCL pose; initial pose will not be reset')
@@ -129,22 +152,38 @@ class ExistingPoseNavigator(BasicNavigator):
 
 
 def navigate(nav, target, timeout, cancel=None):
+    from pallet_alignment_trial import lift
     x, y, yaw = target
     nav.waitUntilNav2Active()
-    nav.localize()
+    lift(nav, 'UP', NAV_LIFT_UP, cancel)
     goal_pose = PoseStamped()
     goal_pose.header.frame_id = 'map'
-    goal_pose.header.stamp = nav.get_clock().now().to_msg()
     goal_pose.pose.position.x = float(x)
     goal_pose.pose.position.y = float(y)
     goal_pose.pose.position.z = 0.0
     yaw = math.radians(yaw)
     goal_pose.pose.orientation.z = math.sin(yaw / 2.0)
     goal_pose.pose.orientation.w = math.cos(yaw / 2.0)
-    if not nav.goToPose(goal_pose):
-        print('목표가 거부되었습니다.')
-        return False
-    return wait_task(nav, timeout, '이동', cancel)
+    # Retries: a brief /scan or TF dropout makes Nav2 fail at once on a stale transform.
+    for attempt in range(NAV_RETRIES+1):
+        try:
+            nav.localize()
+        except LinkTimeout as error:
+            if attempt < NAV_RETRIES:
+                print(f'{error}: 재시도합니다 ({attempt+1}/{NAV_RETRIES}).')
+                continue
+            if not isinstance(error, AmclTimeout):
+                raise
+            print(f'경고: {error}; 위치 보정 확인 없이 이동합니다.')
+        goal_pose.header.stamp = nav.get_clock().now().to_msg()
+        if not nav.goToPose(goal_pose):
+            print('목표가 거부되었습니다.')
+            return False
+        if wait_task(nav, timeout, '이동', cancel):
+            return True
+        if attempt == NAV_RETRIES or nav.getResult() != TaskResult.FAILED:
+            return False
+        print(f'이동 실패: 위치를 다시 맞추고 재시도합니다 ({attempt+1}/{NAV_RETRIES}).')
 
 
 def wait_task(nav, timeout, name, cancel=None):
@@ -172,9 +211,28 @@ def lower(nav, cfg, suffix='', stage=lambda name: None, cancel=None):
     lift(nav, 'DOWN', cfg['lift_time'], cancel)
     # Nav2 BackUp behavior (cmd_vel_nav chain, costmap collision check).
     stage('BACKUP'+suffix)
-    if not nav.backup(backup_dist=0.15, backup_speed=0.025, time_allowance=20):
-        return False
-    return wait_task(nav, 30, '후진', cancel)
+    # Odom (not map) measures what was already backed, so a retry covers only the rest.
+    start = odom_xy(nav)
+    for attempt in range(NAV_RETRIES+1):
+        x, y = odom_xy(nav)
+        remaining = BACKUP_DISTANCE-math.hypot(x-start[0], y-start[1])
+        if remaining < .01:
+            return True
+        if not nav.backup(backup_dist=remaining, backup_speed=0.025, time_allowance=20):
+            return False
+        if wait_task(nav, 30, '후진', cancel):
+            return True
+        if attempt == NAV_RETRIES or nav.getResult() != TaskResult.FAILED:
+            return False
+        print(f'후진 실패: 남은 거리를 재시도합니다 ({attempt+1}/{NAV_RETRIES}).')
+    return False
+
+
+def odom_xy(nav):
+    for _ in range(3):  # Pick up the latest odom TF before reading it.
+        rclpy.spin_once(nav, timeout_sec=.05)
+    t = nav.tf_buffer.lookup_transform('odom', 'base_footprint', Time()).transform.translation
+    return t.x, t.y
 
 
 def replace_pallet(nav, target, cfg, timeout, show=False, enable_camera=False, stage=lambda name: None, cancel=None):

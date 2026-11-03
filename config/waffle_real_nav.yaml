@@ -112,8 +112,10 @@ controller_server:
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath"]
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      # Also counts in-place rotation as progress (final alignment near a 0.03m goal).
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.1
+      required_movement_angle: 0.2
       movement_time_allowance: 10.0
     goal_checker:
       stateful: true
