@@ -36,12 +36,13 @@ DEFAULT_CONFIG = ROOT / 'config/trial.yaml'
 DEFAULT_OUTPUT = ROOT / 'output/pallet_alignment_trials'
 # Longest Wi-Fi/DDS dropout ridden out at zero velocity before aborting (odom/sensor state, rear scan).
 LINK_WAIT = 5.
-INSERT_LIFT_DOWN = 8.  # s of lift DOWN while stopped right before the insertion drive
+YAW_LOCK_GAP_BAND = .03  # m around target_body_gap where an observed yaw is locked for insertion
+PLACE_CORRECTIONS = 6
 
 
 def validate_trial_config(cfg):
     validate_fixed_target_config(cfg)
-    for key in ('lift_time', 'retreat_distance'):
+    for key in ('lift_time', 'retreat_distance', 'place_lateral_tolerance', 'place_yaw_tolerance_deg'):
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f'{key} must be finite and positive')
@@ -162,7 +163,13 @@ class Trial(PalletAligner):
         if (scan.range_max < .5 or len(covered) < 20
                 or covered[0] > -math.radians(55) or covered[-1] < math.radians(55)
                 or np.max(np.diff(covered)) > math.radians(5)):
-            raise RuntimeError('Backoff rear scan coverage is incomplete')
+            detail = f'{len(covered)} valid rays, range_max={scan.range_max:.2f}m'
+            if len(covered) > 1:
+                gap = int(np.argmax(np.diff(covered)))
+                detail += (f', span {math.degrees(covered[0]):+.1f}..{math.degrees(covered[-1]):+.1f}deg'
+                           f', widest gap {math.degrees(covered[gap+1]-covered[gap]):.1f}deg'
+                           f' at {math.degrees(covered[gap]):+.1f}..{math.degrees(covered[gap+1]):+.1f}deg')
+            raise RuntimeError(f'Backoff rear scan coverage is incomplete ({detail})')
         finite = np.isfinite(ranges) & (ranges >= scan.range_min) & (ranges <= scan.range_max)
         points = rays[finite]*ranges[finite, None]+[p.x, p.y, p.z]
         # URDF rear face is x=-0.197m. Check an extra ~0.20m behind it,
@@ -320,7 +327,9 @@ class Trial(PalletAligner):
         while rclpy.ok() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=.02)
             if self.execute and not self.chain_active():
-                raise RuntimeError('Velocity smoother/collision monitor state lost')
+                if time.monotonic()-self.link_resumed > 3.:
+                    raise RuntimeError('Velocity smoother/collision monitor state lost')
+                continue
             if self.image is None or not self.image_fresh(*self.image):
                 continue
             message, received = self.image
@@ -365,7 +374,11 @@ class Trial(PalletAligner):
                 raise RuntimeError('Alignment timeout')
             rclpy.spin_once(self, timeout_sec=.02)
             if not self.chain_active():
-                raise RuntimeError('Velocity smoother/collision monitor state lost')
+                # A link/scan pause also stalls lifecycle polling: hold zero up to 3s while it refreshes.
+                if time.monotonic()-self.link_resumed > 3.:
+                    raise RuntimeError('Velocity smoother/collision monitor state lost')
+                self.command()
+                continue
             if kind == 'turn':
                 error = wrap_angle(value-self.odometry[2])
                 # 0.3deg moves the fork line ~2mm at the pallet face.
@@ -401,12 +414,21 @@ class Trial(PalletAligner):
             if self.execute:
                 self.preflight_motion()
             deadline = time.monotonic()+self.cfg['alignment_timeout']
+            yaw_locked = False
             for observation in range(1, self.cfg['max_observations']+1):
-                pallet = self.observe()
+                observed = self.observe()
+                # The camera yaw shifts ~5deg per 10cm of gap, so back-off and approach chased
+                # each other. Hold one yaw and refresh only the position: the first observation's
+                # until one is taken near the insertion gap, then that one for good.
+                near = (abs(alignment_errors(observed, self.odometry, self.cfg)[0]-self.cfg['target_body_gap'])
+                        <= YAW_LOCK_GAP_BAND)
+                if observation == 1 or (near and not yaw_locked):
+                    pallet_yaw, yaw_locked = observed[2], near
+                pallet = (observed[0], observed[1], pallet_yaw)
                 errors = alignment_errors(pallet, self.odometry, self.cfg)
                 moves = [] if aligned(errors, self.cfg) else plan_moves(pallet, self.odometry, self.cfg)
                 self.records.append({'t': time.monotonic()-self.start_time, 'observation': observation,
-                                     'pallet_odom': pallet, 'odom': self.odometry,
+                                     'pallet_odom': pallet, 'observed_yaw': observed[2], 'yaw_locked': yaw_locked, 'odom': self.odometry,
                                      'errors': errors, 'moves': moves})
                 gap, cross, heading, face = errors
                 self.get_logger().info(f'Observation {observation}: gap={gap:.3f}m, face={face*1000:+.1f}mm, '
@@ -423,7 +445,6 @@ class Trial(PalletAligner):
                         self.records.append({'t': time.monotonic()-self.start_time, 'insertion_travel': travel,
                                              'placement': self.placement})
                         speed = self.cfg['insertion_speed']
-                        self.lift_stopped('DOWN', INSERT_LIFT_DOWN)
                         self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
                         self.lift_stopped('UP', self.cfg['lift_time'])
                         retreat = self.cfg['retreat_distance']
@@ -459,39 +480,61 @@ class Trial(PalletAligner):
         try:
             self.preflight_motion()
             deadline = time.monotonic()+self.cfg['alignment_timeout']
+            # Read AMCL once while stopped and express the saved pose in odom: AMCL jumps ~10mm/1.5deg
+            # between short moves, so the corrections below use odometry only.
             tx, ty, tyaw = placement['pose']
-            for correction in range(1, 4):
-                x, y, yaw = self.map_pose()
+            x, y, yaw = self.map_pose()
+            c, s = math.cos(yaw), math.sin(yaw)
+            ahead, side = c*(tx-x)+s*(ty-y), -s*(tx-x)+c*(ty-y)
+            ox, oy, oyaw = self.odometry[:3]
+            c, s = math.cos(oyaw), math.sin(oyaw)
+            gx, gy, gyaw = ox+c*ahead-s*side, oy+s*ahead+c*side, wrap_angle(oyaw+tyaw-yaw)
+            self.records.append({'t': time.monotonic()-self.start_time, 'map_pose': (x, y, yaw),
+                                 'odom_pose': (ox, oy, oyaw), 'odom_target': (gx, gy, gyaw)})
+            for correction in range(1, PLACE_CORRECTIONS+1):
+                x, y, yaw = self.odometry[:3]
                 c, s = math.cos(yaw), math.sin(yaw)
-                ahead, side = c*(tx-x)+s*(ty-y), -s*(tx-x)+c*(ty-y)
-                heading = wrap_angle(tyaw-yaw)
+                ahead, side = c*(gx-x)+s*(gy-y), -s*(gx-x)+c*(gy-y)
+                heading = wrap_angle(gyaw-yaw)
                 self.records.append({'t': time.monotonic()-self.start_time, 'correction': correction,
-                                     'map_pose': (x, y, yaw), 'ahead': ahead, 'side': side, 'heading': heading})
+                                     'odom_pose': (x, y, yaw), 'ahead': ahead, 'side': side, 'heading': heading})
                 self.get_logger().info(f'Correction {correction}: ahead={ahead*1000:+.1f}mm, '
                                        f'side={side*1000:+.1f}mm, heading={math.degrees(heading):+.2f}deg')
-                if (abs(side) <= self.cfg['lateral_tolerance']
-                        and abs(heading) <= math.radians(self.cfg['yaw_tolerance_deg'])):
+                if (abs(side) <= self.cfg['place_lateral_tolerance']
+                        and abs(heading) <= math.radians(self.cfg['place_yaw_tolerance_deg'])):
                     break
                 distance = math.hypot(ahead, side)
                 if distance > self.cfg['max_move_distance']:
                     raise RuntimeError('Saved pose is farther than max_move_distance; check AMCL')
-                odom_yaw = self.odometry[2]
-                if abs(side) > self.cfg['lateral_tolerance']:
+                if abs(side) > self.cfg['place_lateral_tolerance']:
                     # Turn at most 90deg toward (or away from) the saved point and drive straight onto it.
                     bearing = math.atan2(side, ahead)
                     if abs(bearing) > math.pi/2:
                         bearing, distance = wrap_angle(bearing+math.pi), -distance
-                    self.move('turn', wrap_angle(odom_yaw+bearing), deadline)
+                    self.move('turn', wrap_angle(yaw+bearing), deadline)
                     self.move('drive', distance, deadline)
-                self.move('turn', wrap_angle(odom_yaw+heading), deadline)
+                self.move('turn', gyaw, deadline)
             else:
-                raise RuntimeError('Saved pose not reached within 3 corrections')
+                raise RuntimeError(f'Saved pose not reached within {PLACE_CORRECTIONS} corrections')
             # Remaining along-heading offset is folded into the straight travel.
             travel = placement['travel']+ahead
             self.get_logger().info(f'Placing: straight {travel*1000:.0f}mm forward')
             self.records.append({'t': time.monotonic()-self.start_time, 'placement_travel': travel})
             speed = self.cfg['insertion_speed']
             self.move('drive', travel, time.monotonic()+travel/speed+30, speed)
+            return True
+        finally:
+            for _ in range(3):
+                self.command()
+                time.sleep(.03)
+
+    def back_out(self, distance):
+        """Straight reverse on odometry from under a lowered pallet."""
+        self.get_logger().info(f'EXECUTE: back out straight {distance*1000:.0f}mm')
+        try:
+            self.preflight_motion()
+            speed = self.cfg['insertion_speed']
+            self.move('drive', -distance, time.monotonic()+distance/speed+30, speed)
             return True
         finally:
             for _ in range(3):
@@ -554,6 +597,14 @@ def place_pallet(cfg, placement, output=DEFAULT_OUTPUT, cancel=None):
     node = Trial(cfg, True)
     node.cancel = cancel
     return finish_run(node, lambda: node.place(placement), True, False, output)
+
+
+def back_out(cfg, distance, output=DEFAULT_OUTPUT, cancel=None):
+    """Reverse straight out after the caller lowered the lift."""
+    validate_trial_config(cfg)
+    node = Trial(cfg, True)
+    node.cancel = cancel
+    return finish_run(node, lambda: node.back_out(distance), True, False, output)
 
 
 def finish_run(node, work, execute, show, output):

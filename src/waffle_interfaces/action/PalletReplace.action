@@ -7,5 +7,5 @@ bool success
 string message
 ---
 # NAV_TO_PICK, ALIGN (alignment, insertion, lift up, retreat), NAV_TO_DROP, LIFT_DOWN, BACKUP,
-# NAV_TO_PICK_2, ALIGN_2, NAV_TO_PLACE, PLACE (pose correction, straight in), LIFT_DOWN_2, BACKUP_2, NAV_TO_HOME
+# NAV_TO_PICK_2, ALIGN_2, NAV_TO_PLACE, LIFT_DOWN_2, PLACE (pose correction, straight in), BACKUP_2, NAV_TO_VIA, NAV_TO_HOME
 string stage

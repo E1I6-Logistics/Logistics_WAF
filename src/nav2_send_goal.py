@@ -20,7 +20,8 @@ DESTINATIONS = {
     2: (0.512388313505402, 0.5344194149087085, 90),
 #    3: (0.762388313505402, 0.3044194149087085, 90),
     3: (1.052388313505402, 0.2444194149087085, 90),
-    4: (1.905751886319870, -0.23540788720650954, 180)
+    4: (1.905751886319870, -0.23540788720650954, 180),
+    5: (1.052388313505402, -0.0015077706338736544, 0)
 }
 
 # Scan-to-map correction before each Nav2 move (replaces RViz 2D Pose Estimate).
@@ -28,7 +29,7 @@ LOCALIZE_SEARCH = (0.30, math.radians(30))  # +-position (m), +-heading searched
 LOCALIZE_MIN_SCORE = 0.5  # mean scan-to-wall match (0..1) required to move
 NAV_RETRIES = 3  # retries after a Nav2 FAILED result or a sensor/TF dropout
 BACKUP_DISTANCE = 0.15
-NAV_LIFT_UP = 7.0  # s of lift UP while stopped before each Nav2 move
+LOWER_LIFT_DOWN = 11.0  # s of lift DOWN while stopped before backing out
 
 
 class LinkTimeout(RuntimeError):
@@ -152,10 +153,8 @@ class ExistingPoseNavigator(BasicNavigator):
 
 
 def navigate(nav, target, timeout, cancel=None):
-    from pallet_alignment_trial import lift
     x, y, yaw = target
     nav.waitUntilNav2Active()
-    lift(nav, 'UP', NAV_LIFT_UP, cancel)
     goal_pose = PoseStamped()
     goal_pose.header.frame_id = 'map'
     goal_pose.pose.position.x = float(x)
@@ -206,38 +205,18 @@ def wait_task(nav, timeout, name, cancel=None):
 
 def lower(nav, cfg, suffix='', stage=lambda name: None, cancel=None):
     """Lift down where the robot stands, then back the forks out."""
-    from pallet_alignment_trial import lift
+    from pallet_alignment_trial import back_out, lift
     stage('LIFT_DOWN'+suffix)
-    lift(nav, 'DOWN', cfg['lift_time'], cancel)
-    # Nav2 BackUp behavior (cmd_vel_nav chain, costmap collision check).
+    lift(nav, 'DOWN', LOWER_LIFT_DOWN, cancel)
+    # Straight cmd_vel reverse (collision_monitor still applies): Nav2 BackUp refuses to
+    # start when the lowered pallet sits inside the footprint on the local costmap.
     stage('BACKUP'+suffix)
-    # Odom (not map) measures what was already backed, so a retry covers only the rest.
-    start = odom_xy(nav)
-    for attempt in range(NAV_RETRIES+1):
-        x, y = odom_xy(nav)
-        remaining = BACKUP_DISTANCE-math.hypot(x-start[0], y-start[1])
-        if remaining < .01:
-            return True
-        if not nav.backup(backup_dist=remaining, backup_speed=0.025, time_allowance=20):
-            return False
-        if wait_task(nav, 30, '후진', cancel):
-            return True
-        if attempt == NAV_RETRIES or nav.getResult() != TaskResult.FAILED:
-            return False
-        print(f'후진 실패: 남은 거리를 재시도합니다 ({attempt+1}/{NAV_RETRIES}).')
-    return False
-
-
-def odom_xy(nav):
-    for _ in range(3):  # Pick up the latest odom TF before reading it.
-        rclpy.spin_once(nav, timeout_sec=.05)
-    t = nav.tf_buffer.lookup_transform('odom', 'base_footprint', Time()).transform.translation
-    return t.x, t.y
+    return back_out(cfg, BACKUP_DISTANCE, cancel=cancel)
 
 
 def replace_pallet(nav, target, cfg, timeout, show=False, enable_camera=False, stage=lambda name: None, cancel=None):
-    """Pick at target → drop at destination 2 → pick at destination 3 → place at target's spot → destination 4."""
-    from pallet_alignment_trial import place_pallet, run_trial
+    """Pick at target → drop at destination 2 → pick at destination 3 → place at target's spot → destination 5 → 4."""
+    from pallet_alignment_trial import back_out, lift, place_pallet, run_trial
     placement = {}
     stage('NAV_TO_PICK')
     if not navigate(nav, target, timeout, cancel):
@@ -263,10 +242,17 @@ def replace_pallet(nav, target, cfg, timeout, show=False, enable_camera=False, s
     x, y, yaw = placement['pose']
     if not navigate(nav, (x, y, math.degrees(yaw)), timeout, cancel):
         return False
+    stage('LIFT_DOWN_2')
+    lift(nav, 'DOWN', LOWER_LIFT_DOWN, cancel)
     stage('PLACE')
     if not place_pallet(cfg, placement, cancel=cancel):
         return False
-    if not lower(nav, cfg, '_2', stage, cancel):
+    stage('BACKUP_2')
+    if not back_out(cfg, BACKUP_DISTANCE, cancel=cancel):
+        return False
+    # Pass destination 5 on the way to destination 4.
+    stage('NAV_TO_VIA')
+    if not navigate(nav, DESTINATIONS[5], timeout, cancel):
         return False
     stage('NAV_TO_HOME')
     return navigate(nav, DESTINATIONS[4], timeout, cancel)
@@ -312,7 +298,7 @@ def main():
         if not args.execute:
             print(f'관찰 모드: 목적지 {args.destination} {target}; Nav2 목표와 속도 명령을 보내지 않습니다.')
         else:
-            print(f'목적지 {args.destination} {target}의 팔레트를 목적지 2 {DESTINATIONS[2]}에 내려놓고, 목적지 3 {DESTINATIONS[3]}의 팔레트를 그 자리에 옮긴 뒤 목적지 4 {DESTINATIONS[4]}로 이동합니다.')
+            print(f'목적지 {args.destination} {target}의 팔레트를 목적지 2 {DESTINATIONS[2]}에 내려놓고, 목적지 3 {DESTINATIONS[3]}의 팔레트를 그 자리에 옮긴 뒤 목적지 5 {DESTINATIONS[5]}를 거쳐 목적지 4 {DESTINATIONS[4]}로 이동합니다.')
 
     # Keep ROS alive during Ctrl+C cleanup so cancellation/zero commands can be sent.
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
@@ -329,7 +315,7 @@ def main():
     except KeyboardInterrupt:
         print('사용자가 중단했습니다.')
         return 130
-    except RuntimeError as error:
+    except RuntimeError as error: 
         print(f'작업 중단: {error}')
         return 1
     finally:

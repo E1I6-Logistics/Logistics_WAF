@@ -8,7 +8,7 @@
 staging_target_gap: 0.350
 backoff_gap: 0.410
 max_move_distance: 0.25
-max_observations: 10
+max_observations: 15
 # Every stopped frame must agree with the median (odom frame).
 target_position_spread: 0.015
 target_yaw_spread_deg: 3.0
@@ -20,11 +20,11 @@ center_web_width: 0.021248
 target_body_gap: 0.31
 fork_projection: 0.152
 # Fork tip depth inside the opening. Internal obstacle is at 119mm.
-insertion_depth: 0.115
+insertion_depth: 0.105
 # Linear actuator has no position feedback: UP/DOWN runs this long (full stroke + margin), then STOP.
-lift_time: 20.0
+lift_time: 10.0
 # Straight reverse after lifting (rear scan corridor check applies).
-retreat_distance: 0.06
+retreat_distance: 0.10
 extrinsics_verified: true
 base_frame: base_link
 body_front_x: 0.068
@@ -52,13 +52,16 @@ max_pallet_yaw_deg: 35.0
 # Move planning. lateral: base_link off the entry centerline -> centerline maneuver.
 # face: fork line offset at the pallet face -> turn toward the opening center.
 lateral_tolerance: 0.008
-face_lateral_tolerance: 0.002
+face_lateral_tolerance: 0.003
 gap_tolerance: 0.005
 yaw_tolerance_deg: 1.5
 # Verification while stopped (fork side clearance is ~4.4mm per tine).
-completion_face_lateral_tolerance: 0.004
-completion_yaw_tolerance_deg: 2.0
+completion_face_lateral_tolerance: 0.005
+completion_yaw_tolerance_deg: 3.0
 completion_gap_tolerance: 0.007
+# PLACE: saved-pose correction on odometry after one AMCL read.
+place_lateral_tolerance: 0.020
+place_yaw_tolerance_deg: 3.0
 near_guard_gap: 0.32
 min_body_gap: 0.28
 max_linear_speed: 0.01
@@ -69,7 +72,7 @@ stable_frames: 8
 max_image_age: 0.4
 max_info_age: 2.0
 lost_timeout: 2.0
-alignment_timeout: 300.0
+alignment_timeout: 450.0
 startup_timeout: 12.0
 pose_refine_lm: true
 vertical_face_fit: true

@@ -14,8 +14,8 @@ def validate_fixed_target_config(cfg):
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f'{key} must be finite and positive')
-    if type(cfg.get('max_observations')) is not int or not 2 <= cfg['max_observations'] <= 10:
-        raise ValueError('max_observations must be an integer from 2 to 10')
+    if type(cfg.get('max_observations')) is not int or not 2 <= cfg['max_observations'] <= 15:
+        raise ValueError('max_observations must be an integer from 2 to 15')
     if not (max(cfg['min_body_gap'], cfg['fork_projection'])
             < cfg['target_body_gap']-cfg['completion_gap_tolerance']
             < cfg['target_body_gap']+cfg['completion_gap_tolerance']
